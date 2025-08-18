@@ -39,33 +39,30 @@ This system builds a **semantic search engine** that:
 git clone <your-repo>
 cd semantic-search-system
 
-# Install dependencies
+# Option A: Automated CPU-optimized setup (Recommended)
+python setup_cpu.py
+
+# Option B: Manual installation
 pip install -r requirements.txt
 
 # Install system dependencies (Ubuntu/Debian)
-sudo apt-get install tesseract-ocr
+sudo apt-get install tesseract-ocr ffmpeg
 
-# For video processing (optional)
-sudo apt-get install ffmpeg
+# macOS
+brew install tesseract ffmpeg
 ```
 
-### 2. Configuration
+### 2. Download Models
 
-Edit `config.yaml` to set your data path and LLM preferences:
+```bash
+# Download recommended models (1GB total)
+python download_models.py --recommended
 
-```yaml
-# Paths
-DATA_PATH: ./data  # Your documents folder
-INDEX_DIR: ./indices
-SQLITE_DB: index.db
+# Or list all available models
+python download_models.py --list
 
-# LLM Configuration - choose your model
-LLM_FAMILY: llama  # llama, gemma, phi, qwen, mistral
-LLM_MODEL_PATH: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
-
-# Alternative options:
-# LLM_FAMILY: gemma
-# LLM_MODEL_PATH: models/gemma-2b-it-q4_k_m.gguf
+# Or download specific model
+python download_models.py --model tinyllama-1.1b-chat
 ```
 
 ### 3. Build Index
@@ -101,7 +98,9 @@ python main.py --interactive
 **Available commands:**
 - Type any question to search
 - `rag: <question>` - Get AI-powered answers
-- `llm: <llm_name>` - Switch between available LLMs
+- `model: <model_name>` - Switch/load models
+- `unload: <model_name>` - Unload models from memory
+- `models` - List available models and status
 - `template: <template_name>` - Change prompt templates
 - `stats` - View index statistics
 - `quit` - Exit
@@ -113,9 +112,14 @@ python main.py --interactive
 python main.py --build-index
 python main.py --rebuild-index
 
+# Model management
+python main.py --models                              # List available models
+python main.py --load-model tinyllama-1.1b-chat     # Load specific model
+python main.py --unload-model tinyllama-1.1b-chat   # Unload model
+
 # Search operations
 python main.py --search "machine learning" --top-k 10
-python main.py --ask "Explain machine learning" --template detailed
+python main.py --ask "Explain machine learning" --template detailed --llm phi3-mini-instruct
 
 # View statistics
 python main.py --stats

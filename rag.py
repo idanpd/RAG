@@ -1,5 +1,6 @@
 """
-RAG (Retrieval-Augmented Generation) system with support for multiple small LLMs.
+RAG (Retrieval-Augmented Generation) system with support for multiple local small LLMs.
+Optimized for fast CPU inference with local models.
 """
 
 import os
@@ -9,6 +10,7 @@ from typing import Dict, List, Any, Optional, Union
 import logging
 
 from utils import ConfigManager
+from model_api import LocalModelAPI
 
 logger = logging.getLogger(__name__)
 
@@ -262,82 +264,84 @@ class OllamaLLM(BaseLLM):
             return f"Error: {e}"
 
 
-class LLMManager:
-    """Manages multiple LLM implementations and provides unified interface."""
+class LocalLLMManager:
+    """Manages multiple local LLM models with CPU optimization."""
     
     def __init__(self, config: ConfigManager):
         self.config = config
-        self.llms = {}
-        self.active_llm = None
-        self._initialize_llms()
-    
-    def _initialize_llms(self):
-        """Initialize available LLMs."""
-        llm_config = self.config.config
+        self.model_api = LocalModelAPI(config)
+        self.active_model = self.config.get('DEFAULT_MODEL', 'tinyllama-1.1b-chat')
         
-        # Try llama.cpp first (most common for local models)
-        if llm_config.get('LLM_MODEL_PATH'):
-            try:
-                llamacpp_llm = LlamaCppLLM(llm_config)
-                if llamacpp_llm.is_available():
-                    self.llms['llamacpp'] = llamacpp_llm
-                    if not self.active_llm:
-                        self.active_llm = 'llamacpp'
-                        logger.info("Using llama.cpp as primary LLM")
-            except Exception as e:
-                logger.warning(f"Failed to initialize llama.cpp: {e}")
+        # Get available models
+        self.available_models = self.model_api.list_available_models()
         
-        # Try Transformers
-        if llm_config.get('HF_MODEL_NAME'):
-            try:
-                transformers_llm = TransformersLLM(llm_config)
-                if transformers_llm.is_available():
-                    self.llms['transformers'] = transformers_llm
-                    if not self.active_llm:
-                        self.active_llm = 'transformers'
-                        logger.info("Using Transformers as primary LLM")
-            except Exception as e:
-                logger.warning(f"Failed to initialize Transformers: {e}")
-        
-        # Try Ollama
-        if llm_config.get('OLLAMA_MODEL'):
-            try:
-                ollama_llm = OllamaLLM(llm_config)
-                if ollama_llm.is_available():
-                    self.llms['ollama'] = ollama_llm
-                    if not self.active_llm:
-                        self.active_llm = 'ollama'
-                        logger.info("Using Ollama as primary LLM")
-            except Exception as e:
-                logger.warning(f"Failed to initialize Ollama: {e}")
-        
-        if not self.llms:
-            logger.error("No LLMs available!")
+        if self.available_models:
+            logger.info(f"Found {len(self.available_models)} local models")
+            for model in self.available_models:
+                status = "loaded" if model['is_loaded'] else "available"
+                logger.info(f"  - {model['name']}: {model['description']} ({status})")
         else:
-            logger.info(f"Available LLMs: {list(self.llms.keys())}")
+            logger.error("No local models found! Please download models to ./models/ directory")
+    
+    def get_available_models(self) -> List[Dict[str, Any]]:
+        """Get list of available models with details."""
+        return self.available_models
     
     def get_available_llms(self) -> List[str]:
-        """Get list of available LLM names."""
-        return list(self.llms.keys())
+        """Get list of available model names (for compatibility)."""
+        return [model['name'] for model in self.available_models]
     
-    def set_active_llm(self, llm_name: str) -> bool:
-        """Set the active LLM."""
-        if llm_name in self.llms:
-            self.active_llm = llm_name
-            logger.info(f"Switched to LLM: {llm_name}")
-            return True
+    def set_active_llm(self, model_name: str) -> bool:
+        """Set the active model."""
+        available_names = [model['name'] for model in self.available_models]
+        
+        if model_name in available_names:
+            self.active_model = model_name
+            # Ensure model is loaded
+            result = self.model_api.load_model(model_name)
+            if result['success']:
+                logger.info(f"Switched to model: {model_name}")
+                return True
+            else:
+                logger.error(f"Failed to load model: {model_name}")
+                return False
         else:
-            logger.error(f"LLM not available: {llm_name}")
+            logger.error(f"Model not available: {model_name}")
             return False
     
-    def generate(self, prompt: str, llm_name: Optional[str] = None, **kwargs) -> str:
-        """Generate text using specified or active LLM."""
-        llm_to_use = llm_name or self.active_llm
+    def load_model(self, model_name: str) -> Dict[str, Any]:
+        """Load a specific model."""
+        return self.model_api.load_model(model_name)
+    
+    def unload_model(self, model_name: str) -> Dict[str, Any]:
+        """Unload a specific model."""
+        return self.model_api.unload_model(model_name)
+    
+    def generate(self, prompt: str, model_name: Optional[str] = None, **kwargs) -> str:
+        """Generate text using specified or active model."""
+        model_to_use = model_name or self.active_model
         
-        if not llm_to_use or llm_to_use not in self.llms:
-            return "Error: No LLM available"
+        if not model_to_use:
+            return "Error: No model specified"
         
-        return self.llms[llm_to_use].generate(prompt, **kwargs)
+        result = self.model_api.generate_text(prompt, model_to_use, **kwargs)
+        
+        if result['success']:
+            return result['text']
+        else:
+            return f"Error: {result.get('error', 'Generation failed')}"
+    
+    def get_model_stats(self) -> Dict[str, Any]:
+        """Get model statistics."""
+        return self.model_api.get_model_stats()
+    
+    def cleanup(self):
+        """Clean up resources."""
+        self.model_api.cleanup()
+
+
+# Keep the old LLMManager name for compatibility
+LLMManager = LocalLLMManager
 
 
 class PromptTemplate:

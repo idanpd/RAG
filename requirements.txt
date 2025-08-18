@@ -32,10 +32,10 @@ pytesseract>=0.3.10  # Requires tesseract-ocr system package
 # Video processing (optional)
 opencv-python>=4.6.0  # For video keyframe extraction
 
-# LLM support
-llama-cpp-python>=0.2.0  # For local LLM inference
-torch>=1.12.0  # For transformers
-requests>=2.28.0  # For Ollama API
+# LLM support (CPU optimized)
+llama-cpp-python>=0.2.0  # For local LLM inference - compile with CPU optimizations
+torch>=1.12.0+cpu  # CPU-only PyTorch for smaller download
+requests>=2.28.0  # For Ollama API and model downloads
 
 # Optional: Token counting
 tiktoken>=0.4.0

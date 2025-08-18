@@ -4,6 +4,7 @@
 DATA_PATH: ./data
 INDEX_DIR: ./indices
 SQLITE_DB: index.db
+MODELS_DIR: ./models
 
 # Embeddings
 EMBED_MODEL: all-MiniLM-L6-v2
@@ -18,22 +19,29 @@ DENSE_TOPK: 50
 RERANK_TOPK: 3
 CROSS_ENCODER: cross-encoder/ms-marco-TinyBERT-L-2-v2
 
-# LLM Configuration
-# Supported families: llama, gemma, phi, qwen, mistral
-LLM_FAMILY: llama
+# Local Model Configuration (CPU Optimized)
+# Available models (place in ./models/ directory):
+# - tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf (600MB, fastest)
+# - gemma-2b-it-q4_k_m.gguf (1.4GB, balanced)
+# - phi-3-mini-4k-instruct-q4.gguf (2.2GB, high quality)
+# - qwen2-0_5b-instruct-q4_0.gguf (400MB, ultra-fast)
+# - mistral-7b-instruct-v0.3.Q4_K_M.gguf (4.1GB, highest quality)
+
+DEFAULT_MODEL: tinyllama-1.1b-chat  # Default model to load
+LLM_FAMILY: llama                   # Current active family
 LLM_MODEL_PATH: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
 
-# Alternative small LLM options:
-# For Gemma 2B: models/gemma-2b-it-q4_k_m.gguf
-# For Phi-3 Mini: models/phi-3-mini-4k-instruct-q4.gguf
-# For Qwen2 0.5B: models/qwen2-0_5b-instruct-q4_0.gguf
-# For Mistral 7B: models/mistral-7b-instruct-v0.3.Q4_K_M.gguf
-
+# CPU Optimization Settings
 LLM_CTX: 2048
-LLM_THREADS: 4
-LLM_N_BATCH: 256
+LLM_THREADS: 0                      # 0 = auto-detect CPU cores
+LLM_N_BATCH: 512                    # Larger batch for CPU
 LLM_TEMP: 0.3
 LLM_MAX_TOKENS: 512
+
+# CPU-specific optimizations
+USE_MMAP: true                      # Memory mapping for faster loading
+USE_MLOCK: false                    # Lock memory (use only if you have enough RAM)
+NUMA: false                         # NUMA optimization (set true for multi-socket systems)
 
 # Image & Video extraction
 USE_OCR: true
