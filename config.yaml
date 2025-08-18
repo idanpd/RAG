@@ -1,7 +1,10 @@
+# Semantic Search System Configuration
+
 # Paths
-DATA_PATH: C:\Users\Hana\Pictures\test
+DATA_PATH: ./data
 INDEX_DIR: ./indices
 SQLITE_DB: index.db
+MODELS_DIR: ./models
 
 # Embeddings
 EMBED_MODEL: all-MiniLM-L6-v2
@@ -9,29 +12,51 @@ CHUNK_SIZE: 500
 CHUNK_OVERLAP: 100
 FAISS_NLIST: 100
 FAISS_PQ_M: 8
-# Retriever
-RERANK_TOPK: 3
 
-# LLM
+# Retriever
+BM25_TOPK: 200
+DENSE_TOPK: 50
+RERANK_TOPK: 3
+CROSS_ENCODER: cross-encoder/ms-marco-TinyBERT-L-2-v2
+
+# Local Model Configuration (CPU Optimized)
+# Available models (place in ./models/ directory):
+# - tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf (600MB, fastest)
+# - gemma-2b-it-q4_k_m.gguf (1.4GB, balanced)
+# - phi-3-mini-4k-instruct-q4.gguf (2.2GB, high quality)
+# - qwen2-0_5b-instruct-q4_0.gguf (400MB, ultra-fast)
+# - mistral-7b-instruct-v0.3.Q4_K_M.gguf (4.1GB, highest quality)
+
+DEFAULT_MODEL: tinyllama-1.1b-chat  # Default model to load
+LLM_FAMILY: llama                   # Current active family
 LLM_MODEL_PATH: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
-LLM_FAMILY: llama         # options: llama | gemma
+
+# CPU Optimization Settings
 LLM_CTX: 2048
-LLM_THREADS: 4
-LLM_N_BATCH: 256
+LLM_THREADS: 0                      # 0 = auto-detect CPU cores
+LLM_N_BATCH: 512                    # Larger batch for CPU
 LLM_TEMP: 0.3
 LLM_MAX_TOKENS: 512
 
+# CPU-specific optimizations
+USE_MMAP: true                      # Memory mapping for faster loading
+USE_MLOCK: false                    # Lock memory (use only if you have enough RAM)
+NUMA: false                         # NUMA optimization (set true for multi-socket systems)
+
 # Image & Video extraction
 USE_OCR: true
-USE_IMAGE_CAPTION: true          # enable tiny CPU captioning
+USE_IMAGE_CAPTION: true
 IMAGE_CAPTION_MODEL: Salesforce/blip-image-captioning-base
-USE_VIDEO_TRANSCRIPT: false      # set true if whisper.cpp available
-WHISPER_CPP_BIN: ""              # e.g., ./whisper.cpp/main
-WHISPER_MODEL: ""                # e.g., ggml-base.en.bin
-
+USE_VIDEO_TRANSCRIPT: false
+WHISPER_CPP_BIN: ""
+WHISPER_MODEL: ""
 USE_VIDEO_KEYFRAME_OCR: true
 KEYFRAME_EVERY_SEC: 3
 KEYFRAME_MAX: 10
+CAPTION_MAX_TOKENS: 32
 
 # Logging
 LOG_LEVEL: INFO
+
+# System
+REBUILD_INDEX: true

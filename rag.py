@@ -1,73 +1,523 @@
-# rag.py
-from retriever import Retriever
-from utils import setup_logger, load_config
-from llama_cpp import Llama
+"""
+RAG (Retrieval-Augmented Generation) system with support for multiple local small LLMs.
+Optimized for fast CPU inference with local models.
+"""
 
-cfg = load_config()
-logger = setup_logger(cfg.get("LOG_LEVEL", "INFO"))
+import os
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Union
+import logging
 
-# --- LLM config (supports TinyLLaMA or Gemma 3 270M through llama.cpp) ---
-LLM_MODEL_PATH = cfg.get("LLM_MODEL_PATH", "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf")
-LLM_CTX = int(cfg.get("LLM_CTX", 2048))
-LLM_THREADS = int(cfg.get("LLM_THREADS", 4))
-LLM_N_BATCH = int(cfg.get("LLM_N_BATCH", 256))
-# LLM_FAMILY: "llama" (default) or "gemma"
-LLM_FAMILY = cfg.get("LLM_FAMILY", "llama").lower()
+from utils import ConfigManager
+from model_api import LocalModelAPI
 
-# llama.cpp supports chat templates via chat_format
-CHAT_FORMAT = None
-if LLM_FAMILY == "gemma":
-    CHAT_FORMAT = "gemma"
+logger = logging.getLogger(__name__)
 
-# Single global instance
-_llm = None
-def _get_llm():
-    global _llm
-    if _llm is None:
-        _llm = Llama(
-            model_path=LLM_MODEL_PATH,
-            n_ctx=LLM_CTX,
-            n_threads=LLM_THREADS,
-            n_batch=LLM_N_BATCH,
-            chat_format=CHAT_FORMAT  # None for llama-family; "gemma" for Gemma 3 270M
-        )
-    return _llm
 
-def build_prompt(query, results):
-    # results: list of dicts {path, text, chunk_id, score}
-    contexts = []
-    for r in results:
-        contexts.append(f"FILE: {r['path']}\nCHUNK_ID: {r['chunk_id']}\n---\n{r['text']}\n")
-    ctx = "\n\n".join(contexts)
-    prompt = f"""You are a helpful assistant. Answer the question ONLY using the provided contexts and cite file paths.
+class BaseLLM(ABC):
+    """Base class for LLM implementations."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.model_path = config.get('LLM_MODEL_PATH', '')
+        self.max_tokens = config.get('LLM_MAX_TOKENS', 512)
+        self.temperature = config.get('LLM_TEMP', 0.3)
+        self.context_length = config.get('LLM_CTX', 2048)
+    
+    @abstractmethod
+    def generate(self, prompt: str, **kwargs) -> str:
+        """Generate text from prompt."""
+        pass
+    
+    @abstractmethod
+    def is_available(self) -> bool:
+        """Check if the LLM is available."""
+        pass
+
+
+class LlamaCppLLM(BaseLLM):
+    """LLM implementation using llama.cpp Python bindings."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        self.llm = None
+        self.family = config.get('LLM_FAMILY', 'llama').lower()
+        self.threads = config.get('LLM_THREADS', 4)
+        self.n_batch = config.get('LLM_N_BATCH', 256)
+        
+        # Chat format mapping for different model families
+        self.chat_format = None
+        if self.family == 'gemma':
+            self.chat_format = 'gemma'
+        elif self.family == 'phi':
+            self.chat_format = 'phi-3'
+        elif self.family == 'qwen':
+            self.chat_format = 'qwen'
+        elif self.family == 'mistral':
+            self.chat_format = 'mistral-instruct'
+        
+        self._initialize()
+    
+    def _initialize(self):
+        """Initialize the llama.cpp model."""
+        try:
+            from llama_cpp import Llama
+            
+            if not os.path.exists(self.model_path):
+                logger.error(f"Model file not found: {self.model_path}")
+                return
+            
+            self.llm = Llama(
+                model_path=self.model_path,
+                n_ctx=self.context_length,
+                n_threads=self.threads,
+                n_batch=self.n_batch,
+                chat_format=self.chat_format,
+                verbose=False
+            )
+            
+            logger.info(f"Initialized {self.family} model: {Path(self.model_path).name}")
+            
+        except ImportError:
+            logger.error("llama-cpp-python not available. Install with: pip install llama-cpp-python")
+        except Exception as e:
+            logger.error(f"Failed to initialize llama.cpp model: {e}")
+    
+    def is_available(self) -> bool:
+        """Check if the LLM is available."""
+        return self.llm is not None
+    
+    def generate(self, prompt: str, **kwargs) -> str:
+        """Generate text using llama.cpp."""
+        if not self.is_available():
+            return "Error: LLM not available"
+        
+        try:
+            # Override config with kwargs
+            max_tokens = kwargs.get('max_tokens', self.max_tokens)
+            temperature = kwargs.get('temperature', self.temperature)
+            
+            # Try chat completion first (for instruct models)
+            if hasattr(self.llm, 'create_chat_completion') and self.chat_format:
+                try:
+                    response = self.llm.create_chat_completion(
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        stream=False
+                    )
+                    return response["choices"][0]["message"]["content"].strip()
+                except Exception:
+                    # Fallback to completion
+                    pass
+            
+            # Use completion API
+            response = self.llm(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stop=kwargs.get('stop', []),
+                echo=False
+            )
+            
+            return response["choices"][0]["text"].strip()
+            
+        except Exception as e:
+            logger.error(f"Text generation failed: {e}")
+            return f"Error: {e}"
+
+
+class TransformersLLM(BaseLLM):
+    """LLM implementation using Transformers library."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        self.model = None
+        self.tokenizer = None
+        self.device = config.get('DEVICE', 'cpu')
+        self._initialize()
+    
+    def _initialize(self):
+        """Initialize the Transformers model."""
+        try:
+            from transformers import AutoTokenizer, AutoModelForCausalLM
+            import torch
+            
+            model_name = self.config.get('HF_MODEL_NAME', 'microsoft/DialoGPT-small')
+            
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16 if self.device == 'cuda' else torch.float32,
+                device_map=self.device if self.device == 'cuda' else None
+            )
+            
+            # Set pad token if not exists
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            logger.info(f"Initialized Transformers model: {model_name}")
+            
+        except ImportError:
+            logger.error("transformers library not available. Install with: pip install transformers torch")
+        except Exception as e:
+            logger.error(f"Failed to initialize Transformers model: {e}")
+    
+    def is_available(self) -> bool:
+        """Check if the LLM is available."""
+        return self.model is not None and self.tokenizer is not None
+    
+    def generate(self, prompt: str, **kwargs) -> str:
+        """Generate text using Transformers."""
+        if not self.is_available():
+            return "Error: LLM not available"
+        
+        try:
+            import torch
+            
+            # Tokenize input
+            inputs = self.tokenizer.encode(prompt, return_tensors="pt")
+            
+            # Generate
+            max_tokens = kwargs.get('max_tokens', self.max_tokens)
+            temperature = kwargs.get('temperature', self.temperature)
+            
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    inputs,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    do_sample=temperature > 0,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id
+                )
+            
+            # Decode output
+            generated = outputs[0][inputs.shape[1]:]  # Remove input tokens
+            response = self.tokenizer.decode(generated, skip_special_tokens=True)
+            
+            return response.strip()
+            
+        except Exception as e:
+            logger.error(f"Text generation failed: {e}")
+            return f"Error: {e}"
+
+
+class OllamaLLM(BaseLLM):
+    """LLM implementation using Ollama API."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        self.base_url = config.get('OLLAMA_BASE_URL', 'http://localhost:11434')
+        self.model_name = config.get('OLLAMA_MODEL', 'llama2')
+        self._test_connection()
+    
+    def _test_connection(self):
+        """Test connection to Ollama server."""
+        try:
+            import requests
+            response = requests.get(f"{self.base_url}/api/tags", timeout=5)
+            self.available = response.status_code == 200
+            if self.available:
+                logger.info(f"Connected to Ollama server: {self.base_url}")
+        except Exception as e:
+            logger.warning(f"Ollama server not available: {e}")
+            self.available = False
+    
+    def is_available(self) -> bool:
+        """Check if Ollama is available."""
+        return getattr(self, 'available', False)
+    
+    def generate(self, prompt: str, **kwargs) -> str:
+        """Generate text using Ollama API."""
+        if not self.is_available():
+            return "Error: Ollama not available"
+        
+        try:
+            import requests
+            
+            payload = {
+                "model": self.model_name,
+                "prompt": prompt,
+                "options": {
+                    "temperature": kwargs.get('temperature', self.temperature),
+                    "num_predict": kwargs.get('max_tokens', self.max_tokens),
+                }
+            }
+            
+            response = requests.post(
+                f"{self.base_url}/api/generate",
+                json=payload,
+                stream=False,
+                timeout=30
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result.get('response', '').strip()
+            else:
+                return f"Error: HTTP {response.status_code}"
+                
+        except Exception as e:
+            logger.error(f"Ollama generation failed: {e}")
+            return f"Error: {e}"
+
+
+class LocalLLMManager:
+    """Manages multiple local LLM models with CPU optimization."""
+    
+    def __init__(self, config: ConfigManager):
+        self.config = config
+        self.model_api = LocalModelAPI(config)
+        self.active_model = self.config.get('DEFAULT_MODEL', 'tinyllama-1.1b-chat')
+        
+        # Get available models
+        self.available_models = self.model_api.list_available_models()
+        
+        if self.available_models:
+            logger.info(f"Found {len(self.available_models)} local models")
+            for model in self.available_models:
+                status = "loaded" if model['is_loaded'] else "available"
+                logger.info(f"  - {model['name']}: {model['description']} ({status})")
+        else:
+            logger.error("No local models found! Please download models to ./models/ directory")
+    
+    def get_available_models(self) -> List[Dict[str, Any]]:
+        """Get list of available models with details."""
+        return self.available_models
+    
+    def get_available_llms(self) -> List[str]:
+        """Get list of available model names (for compatibility)."""
+        return [model['name'] for model in self.available_models]
+    
+    def set_active_llm(self, model_name: str) -> bool:
+        """Set the active model."""
+        available_names = [model['name'] for model in self.available_models]
+        
+        if model_name in available_names:
+            self.active_model = model_name
+            # Ensure model is loaded
+            result = self.model_api.load_model(model_name)
+            if result['success']:
+                logger.info(f"Switched to model: {model_name}")
+                return True
+            else:
+                logger.error(f"Failed to load model: {model_name}")
+                return False
+        else:
+            logger.error(f"Model not available: {model_name}")
+            return False
+    
+    def load_model(self, model_name: str) -> Dict[str, Any]:
+        """Load a specific model."""
+        return self.model_api.load_model(model_name)
+    
+    def unload_model(self, model_name: str) -> Dict[str, Any]:
+        """Unload a specific model."""
+        return self.model_api.unload_model(model_name)
+    
+    def generate(self, prompt: str, model_name: Optional[str] = None, **kwargs) -> str:
+        """Generate text using specified or active model."""
+        model_to_use = model_name or self.active_model
+        
+        if not model_to_use:
+            return "Error: No model specified"
+        
+        result = self.model_api.generate_text(prompt, model_to_use, **kwargs)
+        
+        if result['success']:
+            return result['text']
+        else:
+            return f"Error: {result.get('error', 'Generation failed')}"
+    
+    def get_model_stats(self) -> Dict[str, Any]:
+        """Get model statistics."""
+        return self.model_api.get_model_stats()
+    
+    def cleanup(self):
+        """Clean up resources."""
+        self.model_api.cleanup()
+
+
+# Keep the old LLMManager name for compatibility
+LLMManager = LocalLLMManager
+
+
+class PromptTemplate:
+    """Template for RAG prompts with different styles."""
+    
+    TEMPLATES = {
+        'default': """You are a helpful assistant. Answer the question using only the provided contexts and cite file paths.
 
 CONTEXTS:
-{ctx}
+{context}
 
 QUESTION:
 {query}
 
-Answer concisely and include citations like [file:path]."""
-    return prompt
+Answer concisely and include citations like [file:path].""",
+        
+        'detailed': """You are an expert assistant. Based on the provided contexts, give a comprehensive answer to the question.
 
-def answer_with_llm(prompt):
-    llm = _get_llm()
+CONTEXTS:
+{context}
 
-    # Prefer chat-completions if available; otherwise, plain generate
-    try:
-        # llama_cpp >= 0.2.0
-        res = llm.create_chat_completion(
-            messages=[{"role": "user", "content": prompt}],
-            temperature=float(cfg.get("LLM_TEMP", 0.3)),
-            max_tokens=int(cfg.get("LLM_MAX_TOKENS", 512))
+QUESTION:
+{query}
+
+Instructions:
+- Use only the information from the provided contexts
+- Be thorough and detailed in your response
+- Cite sources using [file:filename] format
+- If the contexts don't contain relevant information, say so clearly
+
+ANSWER:""",
+        
+        'concise': """Answer briefly using only the provided contexts.
+
+CONTEXTS:
+{context}
+
+QUESTION: {query}
+
+BRIEF ANSWER:""",
+        
+        'analytical': """You are an analytical assistant. Analyze the provided contexts to answer the question.
+
+CONTEXTS:
+{context}
+
+QUESTION:
+{query}
+
+Please provide:
+1. A direct answer to the question
+2. Supporting evidence from the contexts
+3. Any limitations or gaps in the available information
+
+Use [file:filename] to cite sources.
+
+ANALYSIS:"""
+    }
+    
+    @classmethod
+    def build_prompt(cls, query: str, results: List[Dict[str, Any]], 
+                    template: str = 'default', max_context_length: int = 2000) -> str:
+        """Build a prompt from query and search results."""
+        if template not in cls.TEMPLATES:
+            template = 'default'
+        
+        # Build context from results
+        contexts = []
+        current_length = 0
+        
+        for result in results:
+            file_path = result.get('path', 'unknown')
+            chunk_text = result.get('text', '')
+            chunk_id = result.get('chunk_id', '')
+            
+            context_entry = f"FILE: {file_path}\nCHUNK_ID: {chunk_id}\n---\n{chunk_text}\n"
+            
+            # Check if adding this context would exceed the limit
+            if current_length + len(context_entry) > max_context_length and contexts:
+                break
+            
+            contexts.append(context_entry)
+            current_length += len(context_entry)
+        
+        context_text = "\n\n".join(contexts)
+        
+        return cls.TEMPLATES[template].format(
+            context=context_text,
+            query=query
         )
-        return res["choices"][0]["message"]["content"].strip()
-    except Exception:
-        # Fallback to raw completion call
-        out = llm(
-            prompt,
-            temperature=float(cfg.get("LLM_TEMP", 0.3)),
-            max_tokens=int(cfg.get("LLM_MAX_TOKENS", 512)),
+
+
+class RAGSystem:
+    """Complete RAG system with retrieval and generation."""
+    
+    def __init__(self, retriever, config: Optional[ConfigManager] = None):
+        self.retriever = retriever
+        self.config = config or ConfigManager()
+        self.llm_manager = LLMManager(self.config)
+        
+        # Configuration
+        self.default_template = self.config.get('RAG_TEMPLATE', 'default')
+        self.max_context_length = self.config.get('MAX_CONTEXT_LENGTH', 2000)
+        
+        logger.info("RAG system initialized")
+    
+    def answer_query(self, query: str, template: Optional[str] = None, 
+                    llm_name: Optional[str] = None, top_k: int = 5) -> Dict[str, Any]:
+        """Answer a query using RAG."""
+        # Retrieve relevant documents
+        logger.info(f"Retrieving documents for query: {query}")
+        results = self.retriever.search(query, top_k)
+        
+        if not results:
+            return {
+                'query': query,
+                'answer': "I couldn't find any relevant information to answer your question.",
+                'sources': [],
+                'llm_used': None
+            }
+        
+        # Convert results to dict format if needed
+        if hasattr(results[0], 'to_dict'):
+            results = [r.to_dict() for r in results]
+        
+        # Build prompt
+        template_name = template or self.default_template
+        prompt = PromptTemplate.build_prompt(
+            query, results, template_name, self.max_context_length
         )
-        # llama_cpp raw uses "choices"[0]["text"]
-        return out["choices"][0].get("text", "").strip()
+        
+        # Generate answer
+        logger.info(f"Generating answer using template: {template_name}")
+        answer = self.llm_manager.generate(prompt, llm_name)
+        
+        # Prepare sources
+        sources = [
+            {
+                'path': r.get('path', ''),
+                'chunk_id': r.get('chunk_id', ''),
+                'score': r.get('final_score', r.get('score', 0)),
+                'summary': r.get('summary', '')
+            }
+            for r in results
+        ]
+        
+        return {
+            'query': query,
+            'answer': answer,
+            'sources': sources,
+            'llm_used': self.llm_manager.active_llm,
+            'template_used': template_name,
+            'context_length': len(prompt)
+        }
+    
+    def get_available_templates(self) -> List[str]:
+        """Get available prompt templates."""
+        return list(PromptTemplate.TEMPLATES.keys())
+    
+    def get_available_llms(self) -> List[str]:
+        """Get available LLMs."""
+        return self.llm_manager.get_available_llms()
+    
+    def set_active_llm(self, llm_name: str) -> bool:
+        """Set the active LLM."""
+        return self.llm_manager.set_active_llm(llm_name)
+
+
+# Legacy compatibility functions
+def build_prompt(query: str, results: List[Dict[str, Any]]) -> str:
+    """Legacy function for building prompts."""
+    return PromptTemplate.build_prompt(query, results, 'default')
+
+
+def answer_with_llm(prompt: str) -> str:
+    """Legacy function for answering with LLM."""
+    config = ConfigManager()
+    llm_manager = LLMManager(config)
+    return llm_manager.generate(prompt)
