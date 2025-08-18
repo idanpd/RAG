@@ -1,5 +1,7 @@
+# Semantic Search System Configuration
+
 # Paths
-DATA_PATH: C:\Users\Hana\Pictures\test
+DATA_PATH: ./data
 INDEX_DIR: ./indices
 SQLITE_DB: index.db
 
@@ -9,12 +11,24 @@ CHUNK_SIZE: 500
 CHUNK_OVERLAP: 100
 FAISS_NLIST: 100
 FAISS_PQ_M: 8
-# Retriever
-RERANK_TOPK: 3
 
-# LLM
+# Retriever
+BM25_TOPK: 200
+DENSE_TOPK: 50
+RERANK_TOPK: 3
+CROSS_ENCODER: cross-encoder/ms-marco-TinyBERT-L-2-v2
+
+# LLM Configuration
+# Supported families: llama, gemma, phi, qwen, mistral
+LLM_FAMILY: llama
 LLM_MODEL_PATH: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
-LLM_FAMILY: llama         # options: llama | gemma
+
+# Alternative small LLM options:
+# For Gemma 2B: models/gemma-2b-it-q4_k_m.gguf
+# For Phi-3 Mini: models/phi-3-mini-4k-instruct-q4.gguf
+# For Qwen2 0.5B: models/qwen2-0_5b-instruct-q4_0.gguf
+# For Mistral 7B: models/mistral-7b-instruct-v0.3.Q4_K_M.gguf
+
 LLM_CTX: 2048
 LLM_THREADS: 4
 LLM_N_BATCH: 256
@@ -23,15 +37,18 @@ LLM_MAX_TOKENS: 512
 
 # Image & Video extraction
 USE_OCR: true
-USE_IMAGE_CAPTION: true          # enable tiny CPU captioning
+USE_IMAGE_CAPTION: true
 IMAGE_CAPTION_MODEL: Salesforce/blip-image-captioning-base
-USE_VIDEO_TRANSCRIPT: false      # set true if whisper.cpp available
-WHISPER_CPP_BIN: ""              # e.g., ./whisper.cpp/main
-WHISPER_MODEL: ""                # e.g., ggml-base.en.bin
-
+USE_VIDEO_TRANSCRIPT: false
+WHISPER_CPP_BIN: ""
+WHISPER_MODEL: ""
 USE_VIDEO_KEYFRAME_OCR: true
 KEYFRAME_EVERY_SEC: 3
 KEYFRAME_MAX: 10
+CAPTION_MAX_TOKENS: 32
 
 # Logging
 LOG_LEVEL: INFO
+
+# System
+REBUILD_INDEX: true

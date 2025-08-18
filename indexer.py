@@ -1,279 +1,590 @@
-# indexer.py
+"""
+Multi-modal semantic indexer with advanced chunking and embedding generation.
+"""
+
 import os
-import faiss
 import sqlite3
 import numpy as np
 from pathlib import Path
-from utils import setup_logger, load_config, ensure_dir, file_sha256
+from typing import Dict, List, Optional, Any, Union, Tuple
+import logging
+from dataclasses import dataclass
+
+import faiss
 from sentence_transformers import SentenceTransformer
-from chunker import Chunker
-from extractors.basic import extract_text  # existing
-from extractors.images import extract_text_from_image, IMAGE_EXTS, caption_image_description  # new caption option
-from extractors.video_extractor import (
-    VIDEO_EXTS,
-    extract_video_transcript_optional,
-    extract_video_keyframe_texts_optional
-)
 
-cfg = load_config()
-logger = setup_logger(cfg.get("LOG_LEVEL", "INFO"))
+from utils import ConfigManager, ensure_dir, file_sha256
+from chunker import SemanticChunker, TextChunk
+from extractors import MultiExtractor, TextExtractor, ImageExtractor, VideoExtractor
 
-DB_PATH = cfg.get("SQLITE_DB", "index.db")
-INDEX_DIR = Path(cfg.get("INDEX_DIR", "./indices"))
-ensure_dir(INDEX_DIR)
+logger = logging.getLogger(__name__)
 
-EMBED_MODEL = cfg.get("EMBED_MODEL", "all-MiniLM-L6-v2")
-FAISS_NLIST = int(cfg.get("FAISS_NLIST", 100))
-FAISS_PQ_M = int(cfg.get("FAISS_PQ_M", 8))
 
-# Audio handled as "other" (no ASR unless you add it separately)
-AUDIO_EXTS = {'.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a'}
-DOC_EXTS = {'.pdf', '.docx', '.doc', '.txt', '.rtf', '.odt'}
-SPREADSHEET_EXTS = {'.xlsx', '.xls', '.csv', '.ods'}
-PRESENTATION_EXTS = {'.pptx', '.ppt', '.odp'}
+@dataclass
+class FileRecord:
+    """Represents a file record in the database."""
+    id: Optional[int]
+    path: str
+    filename: str
+    file_extension: str
+    file_type: str
+    sha256: str
+    size: int
+    processed: bool = False
 
-def get_file_type(path: Path):
-    ext = path.suffix.lower()
-    if ext in VIDEO_EXTS:
-        return 'video'
-    elif ext in AUDIO_EXTS:
-        return 'audio'
-    elif ext in IMAGE_EXTS:
-        return 'image'
-    elif ext in DOC_EXTS:
-        return 'document'
-    elif ext in SPREADSHEET_EXTS:
-        return 'spreadsheet'
-    elif ext in PRESENTATION_EXTS:
-        return 'presentation'
-    else:
-        return 'other'
 
-class Indexer:
-    def __init__(self, data_path):
-        self.data_path = Path(data_path)
-        self.embedder = SentenceTransformer(EMBED_MODEL)
-        self.dim = self.embedder.get_sentence_embedding_dimension()
-        self.chunker = Chunker(
-            chunk_size=int(cfg.get("CHUNK_SIZE", 800)),
-            overlap=int(cfg.get("CHUNK_OVERLAP", 120))
-        )
-        self.conn = sqlite3.connect(DB_PATH)
+@dataclass
+class ChunkRecord:
+    """Represents a chunk record in the database."""
+    id: Optional[int]
+    file_id: int
+    chunk_text: str
+    summary: str
+    chunk_type: str
+    token_count: int
+    prev_id: Optional[int] = None
+    next_id: Optional[int] = None
+    emb_id: Optional[int] = None
+
+
+class DatabaseManager:
+    """Manages SQLite database operations for the indexer."""
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row
         self._ensure_tables()
-
+    
     def _ensure_tables(self):
-        c = self.conn.cursor()
-        c.execute("""CREATE TABLE IF NOT EXISTS files (
-            id INTEGER PRIMARY KEY,
-            path TEXT UNIQUE,
-            filename TEXT,
-            file_extension TEXT,
-            file_type TEXT,
-            sha256 TEXT,
-            size INTEGER
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS chunks (
-            id INTEGER PRIMARY KEY,
-            file_id INTEGER,
-            chunk_text TEXT,
-            summary TEXT,
-            chunk_type TEXT,
-            prev_id INTEGER,
-            next_id INTEGER,
-            emb_id INTEGER
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS history (
-            id INTEGER PRIMARY KEY,
-            query TEXT,
-            ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )""")
+        """Create database tables if they don't exist."""
+        cursor = self.conn.cursor()
+        
+        # Files table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT UNIQUE NOT NULL,
+                filename TEXT NOT NULL,
+                file_extension TEXT,
+                file_type TEXT,
+                sha256 TEXT,
+                size INTEGER,
+                processed BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Chunks table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL,
+                chunk_text TEXT NOT NULL,
+                summary TEXT,
+                chunk_type TEXT DEFAULT 'content',
+                token_count INTEGER DEFAULT 0,
+                prev_id INTEGER,
+                next_id INTEGER,
+                emb_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
+            )
+        """)
+        
+        # Search history table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS search_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query TEXT NOT NULL,
+                results_count INTEGER DEFAULT 0,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Create indexes for better performance
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_files_type ON files(file_type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_emb_id ON chunks(emb_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_type ON chunks(chunk_type)")
+        
         self.conn.commit()
+    
+    def insert_file(self, file_record: FileRecord) -> int:
+        """Insert or update file record and return the file ID."""
+        cursor = self.conn.cursor()
+        
+        cursor.execute("""
+            INSERT OR REPLACE INTO files 
+            (path, filename, file_extension, file_type, sha256, size, processed)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            file_record.path,
+            file_record.filename,
+            file_record.file_extension,
+            file_record.file_type,
+            file_record.sha256,
+            file_record.size,
+            file_record.processed
+        ))
+        
+        self.conn.commit()
+        
+        # Get the file ID
+        cursor.execute("SELECT id FROM files WHERE path = ?", (file_record.path,))
+        result = cursor.fetchone()
+        return result['id'] if result else cursor.lastrowid
+    
+    def insert_chunks(self, chunks: List[ChunkRecord]) -> List[int]:
+        """Insert chunk records and return their IDs."""
+        cursor = self.conn.cursor()
+        chunk_ids = []
+        
+        for chunk in chunks:
+            cursor.execute("""
+                INSERT INTO chunks 
+                (file_id, chunk_text, summary, chunk_type, token_count, prev_id, emb_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                chunk.file_id,
+                chunk.chunk_text,
+                chunk.summary,
+                chunk.chunk_type,
+                chunk.token_count,
+                chunk.prev_id,
+                chunk.emb_id
+            ))
+            chunk_ids.append(cursor.lastrowid)
+        
+        self.conn.commit()
+        return chunk_ids
+    
+    def update_chunk_links(self, chunk_ids: List[int]):
+        """Update prev_id and next_id links for chunks."""
+        cursor = self.conn.cursor()
+        
+        for i, chunk_id in enumerate(chunk_ids):
+            prev_id = chunk_ids[i - 1] if i > 0 else None
+            next_id = chunk_ids[i + 1] if i < len(chunk_ids) - 1 else None
+            
+            cursor.execute("""
+                UPDATE chunks SET prev_id = ?, next_id = ? WHERE id = ?
+            """, (prev_id, next_id, chunk_id))
+        
+        self.conn.commit()
+    
+    def get_all_chunk_texts(self) -> List[Tuple[int, str]]:
+        """Get all chunk texts with their embedding IDs."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT emb_id, chunk_text FROM chunks WHERE emb_id IS NOT NULL ORDER BY emb_id")
+        return [(row['emb_id'], row['chunk_text']) for row in cursor.fetchall()]
+    
+    def get_chunk_by_emb_id(self, emb_id: int) -> Optional[Dict[str, Any]]:
+        """Get chunk information by embedding ID."""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT c.id, c.file_id, c.chunk_text, c.summary, c.chunk_type,
+                   f.path, f.filename, f.file_type
+            FROM chunks c
+            JOIN files f ON c.file_id = f.id
+            WHERE c.emb_id = ?
+        """, (emb_id,))
+        
+        row = cursor.fetchone()
+        if row:
+            return dict(row)
+        return None
+    
+    def clear_all_data(self):
+        """Clear all data from the database."""
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM chunks")
+        cursor.execute("DELETE FROM files")
+        cursor.execute("DELETE FROM search_history")
+        self.conn.commit()
+    
+    def close(self):
+        """Close database connection."""
+        self.conn.close()
 
-    def _create_file_metadata_chunk(self, file_path: str, file_type: str):
-        p = Path(file_path)
-        meta = [
-            f"File: {p.name}",
-            f"Type: {file_type}",
-            f"Extension: {p.suffix}",
-            f"Directory: {p.parent.name}",
-            f"Full path: {file_path}",
-            f"Summary: this is a {file_type} named {p.name} located at {p.parent}"
-        ]
-        # lightweight keywords to help discovery
-        if file_type == 'video':
-            meta.append("Keywords: video file, movie, clip, recording, media, visual content, footage")
-        elif file_type == 'image':
-            meta.append("Keywords: image file, picture, photo, graphic, visual, screenshot")
-        elif file_type == 'audio':
-            meta.append("Keywords: audio file, music, sound, recording, voice, song")
-        elif file_type == 'document':
-            meta.append("Keywords: document, text file, pdf, word document, report, paper")
-        return "\n".join(meta)
 
-    def delete_index(self):
-        # remove faiss index files in INDEX_DIR and clear sqlite tables
-        try:
-            for f in INDEX_DIR.glob("*.index"):
-                f.unlink(missing_ok=True)
-            for f in INDEX_DIR.glob("*.faiss"):
-                f.unlink(missing_ok=True)
-        except Exception as e:
-            logger.error(f"Failed deleting FAISS files: {e}")
-
-        try:
-            c = self.conn.cursor()
-            c.execute("DELETE FROM chunks")
-            c.execute("DELETE FROM files")
-            self.conn.commit()
-            logger.info("Cleared SQLite metadata.")
-        except Exception as e:
-            logger.error(f"Failed clearing SQLite: {e}")
-
-    def index_all(self):
-        # Find files
-        files = [p for p in self.data_path.rglob("*") if p.is_file()]
-        if not files:
-            logger.info("No files found.")
-            return
-
-        chunk_texts = []
-        chunk_meta = []   # tuples: (file_id, summary, prev_id, chunk_type)
-        file_id_map = {}
-
-        ENABLE_OCR = bool(cfg.get("USE_OCR", True))
-        ENABLE_CAPTION = bool(cfg.get("USE_IMAGE_CAPTION", False))
-        ENABLE_VID_TRANSCRIPT = bool(cfg.get("USE_VIDEO_TRANSCRIPT", False))
-        ENABLE_VID_KEYFRAME = bool(cfg.get("USE_VIDEO_KEYFRAME_OCR", False))
-
-        for p in files:
-            try:
-                ftype = get_file_type(p)
-                suf = p.suffix.lower()
-
-                # Extract text content based on type
-                content_text = ""
-                if ftype == 'image':
-                    # OCR
-                    if ENABLE_OCR:
-                        content_text = extract_text_from_image(p)
-                    # Caption (optional tiny model on CPU)
-                    if ENABLE_CAPTION:
-                        cap = caption_image_description(p)
-                        if cap:
-                            content_text = (content_text + "\n" + cap).strip()
-
-                elif ftype == 'video':
-                    # transcript (optional)
-                    if ENABLE_VID_TRANSCRIPT:
-                        t = extract_video_transcript_optional(p)
-                        if t:
-                            content_text += ("\n" + t if content_text else t)
-                    # keyframe OCR (optional)
-                    if ENABLE_VID_KEYFRAME:
-                        ktxt = extract_video_keyframe_texts_optional(p)
-                        if ktxt:
-                            content_text += ("\n" + ktxt if content_text else ktxt)
-
-                else:
-                    # documents/spreadsheets/presentations/others → text extractor
-                    content_text = extract_text(p)
-
-                # Store files entry
-                sha = file_sha256(p)
-                size = p.stat().st_size
-                c = self.conn.cursor()
-                c.execute("""INSERT OR REPLACE INTO files
-                             (path, filename, file_extension, file_type, sha256, size)
-                             VALUES (?,?,?,?,?,?)""",
-                          (str(p), p.name, suf, ftype, sha, size))
-                self.conn.commit()
-                c.execute("SELECT id FROM files WHERE path=?", (str(p),))
-                file_id = c.fetchone()[0]
-                file_id_map[str(p)] = file_id
-
-                # Always add metadata chunk for discovery
-                metadata_chunk = self._create_file_metadata_chunk(str(p), ftype)
-                chunk_texts.append(metadata_chunk)
-                chunk_meta.append((file_id, f"Metadata for {p.name}", None, 'metadata'))
-
-                # Add content chunks if any
-                if content_text and content_text.strip():
-                    chunks = self.chunker.chunk_text(content_text)
-                    prev_sql_id = None
-                    for ch in chunks:
-                        if not ch.strip():
-                            continue
-                        summary = (ch.split(".")[0] + ".")[:300] if "." in ch else ch[:300]
-                        chunk_texts.append(ch)
-                        # we don't know SQL row id before insert; set prev later after insert
-                        chunk_meta.append((file_id, summary, prev_sql_id, 'content'))
-                        # SQL id linking for prev/next is set after we insert below
-
-            except Exception as e:
-                logger.error(f"Failed processing {p}: {e}")
-
-        if not chunk_texts:
-            logger.info("No chunk texts collected.")
-            return
-
-        # Build embeddings
-        logger.info(f"Embedding {len(chunk_texts)} chunks with {EMBED_MODEL}")
-        embeddings = self.embedder.encode(chunk_texts)  # returns float32 np.ndarray
-
-        # Build FAISS index with safe small-dataset fallback
-        index_path = INDEX_DIR / "chunks_ivfpq.index"
-        if index_path.exists():
-            try:
-                index_path.unlink()
-            except Exception as e:
-                logger.error(f"Failed removing existing index: {e}")
-
-        num_vecs = embeddings.shape[0]
-        if num_vecs < 100:  # too small for IVF training → use flat
-            logger.info(f"Small dataset ({num_vecs}) → using IndexFlatL2")
-            index = faiss.IndexFlatL2(self.dim)
+class EmbeddingManager:
+    """Manages embedding generation and FAISS index operations."""
+    
+    def __init__(self, config: ConfigManager, index_dir: Path):
+        self.config = config
+        self.index_dir = ensure_dir(index_dir)
+        
+        # Initialize sentence transformer
+        model_name = self.config.get('EMBED_MODEL', 'all-MiniLM-L6-v2')
+        self.embedder = SentenceTransformer(model_name)
+        self.embedding_dim = self.embedder.get_sentence_embedding_dimension()
+        
+        logger.info(f"Initialized embedder: {model_name} (dim={self.embedding_dim})")
+    
+    def create_embeddings(self, texts: List[str]) -> np.ndarray:
+        """Generate embeddings for a list of texts."""
+        if not texts:
+            return np.array([]).reshape(0, self.embedding_dim)
+        
+        logger.info(f"Generating embeddings for {len(texts)} texts...")
+        embeddings = self.embedder.encode(texts, convert_to_numpy=True, show_progress_bar=True)
+        return embeddings.astype(np.float32)
+    
+    def build_faiss_index(self, embeddings: np.ndarray) -> faiss.Index:
+        """Build FAISS index from embeddings."""
+        num_vectors = embeddings.shape[0]
+        
+        if num_vectors == 0:
+            logger.warning("No embeddings to index")
+            return faiss.IndexFlatL2(self.embedding_dim)
+        
+        logger.info(f"Building FAISS index for {num_vectors} vectors...")
+        
+        # Choose index type based on dataset size
+        if num_vectors < 100:
+            # Small dataset - use flat index
+            logger.info("Using IndexFlatL2 for small dataset")
+            index = faiss.IndexFlatL2(self.embedding_dim)
             index.add(embeddings)
         else:
-            # pick nlist & m safely
-            nlist = max(8, min(int(np.sqrt(num_vecs)), FAISS_NLIST, num_vecs // 4))
-            # choose m that divides the dim or fallback to nearest divisor
-            m = min(FAISS_PQ_M, max(2, self.dim // 8))
-            while m > 1 and self.dim % m != 0:
+            # Larger dataset - use IVF+PQ
+            nlist = max(8, min(
+                int(np.sqrt(num_vectors)),
+                self.config.get('FAISS_NLIST', 100),
+                num_vectors // 4
+            ))
+            
+            # Choose PQ parameters
+            m = self.config.get('FAISS_PQ_M', 8)
+            while m > 1 and self.embedding_dim % m != 0:
                 m -= 1
-            if m <= 1 or self.dim % m != 0:
-                m = 8 if self.dim >= 64 else max(2, self.dim // 4)
-
-            logger.info(f"Using IVF+PQ nlist={nlist}, m={m}")
-            quant = faiss.IndexFlatL2(self.dim)
-            index = faiss.IndexIVFPQ(quant, self.dim, nlist, m, 8)
-            logger.info("Training IVF+PQ…")
+            if m <= 1:
+                m = max(2, self.embedding_dim // 8)
+            
+            logger.info(f"Using IndexIVFPQ with nlist={nlist}, m={m}")
+            
+            quantizer = faiss.IndexFlatL2(self.embedding_dim)
+            index = faiss.IndexIVFPQ(quantizer, self.embedding_dim, nlist, m, 8)
+            
+            # Train the index
+            logger.info("Training FAISS index...")
             index.train(embeddings)
             index.add(embeddings)
-
+        
+        return index
+    
+    def save_index(self, index: faiss.Index, filename: str = "chunks_index.faiss"):
+        """Save FAISS index to disk."""
+        index_path = self.index_dir / filename
         faiss.write_index(index, str(index_path))
         logger.info(f"Saved FAISS index to {index_path}")
+        return index_path
+    
+    def load_index(self, filename: str = "chunks_index.faiss") -> Optional[faiss.Index]:
+        """Load FAISS index from disk."""
+        index_path = self.index_dir / filename
+        if not index_path.exists():
+            return None
+        
+        try:
+            index = faiss.read_index(str(index_path))
+            logger.info(f"Loaded FAISS index from {index_path}")
+            return index
+        except Exception as e:
+            logger.error(f"Failed to load FAISS index: {e}")
+            return None
 
-        # Insert chunk rows (and link prev/next)
-        c = self.conn.cursor()
-        row_ids = []
-        for i, meta in enumerate(chunk_meta):
-            file_id, summary, prev_id, chunk_type = meta
-            c.execute("""INSERT INTO chunks (file_id, chunk_text, summary, chunk_type, prev_id, emb_id)
-                         VALUES (?,?,?,?,?,?)""",
-                      (file_id, chunk_texts[i], summary, chunk_type, None, int(i)))
-            row_ids.append(c.lastrowid)
 
-        # now set prev/next using row_ids order per file
-        # We approximate prev/next by consecutive rows per same file_id
-        # (good enough for contextual navigation)
-        last_for_file = {}
-        for sql_id, meta in zip(row_ids, chunk_meta):
-            file_id = meta[0]
-            if file_id in last_for_file:
-                # set prev of current to last, and next of last to current
-                c.execute("UPDATE chunks SET prev_id=? WHERE id=?", (last_for_file[file_id], sql_id))
-                c.execute("UPDATE chunks SET next_id=? WHERE id=?", (sql_id, last_for_file[file_id]))
-            last_for_file[file_id] = sql_id
+class SemanticIndexer:
+    """Main indexer class for multi-modal semantic search."""
+    
+    def __init__(self, config: Optional[ConfigManager] = None):
+        self.config = config or ConfigManager()
+        
+        # Initialize components
+        self.data_path = Path(self.config.get('DATA_PATH', './data'))
+        self.index_dir = Path(self.config.get('INDEX_DIR', './indices'))
+        
+        ensure_dir(self.index_dir)
+        
+        # Initialize database
+        db_path = self.config.get('SQLITE_DB', 'index.db')
+        self.db_manager = DatabaseManager(db_path)
+        
+        # Initialize embedding manager
+        self.embedding_manager = EmbeddingManager(self.config, self.index_dir)
+        
+        # Initialize chunker
+        self.chunker = SemanticChunker(
+            chunk_size=self.config.get('CHUNK_SIZE', 500),
+            overlap=self.config.get('CHUNK_OVERLAP', 100)
+        )
+        
+        # Initialize extractors
+        self.extractor = MultiExtractor([
+            TextExtractor(self.config.config),
+            ImageExtractor(self.config.config),
+            VideoExtractor(self.config.config)
+        ])
+        
+        logger.info(f"Initialized SemanticIndexer with data path: {self.data_path}")
+    
+    def get_file_type(self, path: Path) -> str:
+        """Determine file type based on extension."""
+        ext = path.suffix.lower()
+        
+        if ext in {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.3gp'}:
+            return 'video'
+        elif ext in {'.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a'}:
+            return 'audio'
+        elif ext in {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp', '.gif'}:
+            return 'image'
+        elif ext in {'.pdf', '.docx', '.doc', '.txt', '.rtf', '.odt'}:
+            return 'document'
+        elif ext in {'.xlsx', '.xls', '.csv', '.ods'}:
+            return 'spreadsheet'
+        elif ext in {'.pptx', '.ppt', '.odp'}:
+            return 'presentation'
+        else:
+            return 'other'
+    
+    def create_metadata_chunk(self, file_path: Path, file_type: str) -> str:
+        """Create metadata chunk for file discovery."""
+        metadata_lines = [
+            f"File: {file_path.name}",
+            f"Type: {file_type}",
+            f"Extension: {file_path.suffix}",
+            f"Directory: {file_path.parent.name}",
+            f"Full path: {file_path}",
+            f"Summary: This is a {file_type} file named {file_path.name}"
+        ]
+        
+        # Add type-specific keywords
+        keywords = {
+            'video': "video file, movie, clip, recording, media, visual content, footage",
+            'image': "image file, picture, photo, graphic, visual, screenshot",
+            'audio': "audio file, music, sound, recording, voice, song",
+            'document': "document, text file, pdf, word document, report, paper",
+            'spreadsheet': "spreadsheet, excel, data, table, numbers, calculations",
+            'presentation': "presentation, slides, powerpoint, deck"
+        }
+        
+        if file_type in keywords:
+            metadata_lines.append(f"Keywords: {keywords[file_type]}")
+        
+        return "\n".join(metadata_lines)
+    
+    def process_file(self, file_path: Path) -> Tuple[int, List[ChunkRecord]]:
+        """Process a single file and return file ID and chunks."""
+        try:
+            # Get file info
+            file_type = self.get_file_type(file_path)
+            file_stat = file_path.stat()
+            file_hash = file_sha256(file_path)
+            
+            # Create file record
+            file_record = FileRecord(
+                id=None,
+                path=str(file_path),
+                filename=file_path.name,
+                file_extension=file_path.suffix.lower(),
+                file_type=file_type,
+                sha256=file_hash,
+                size=file_stat.st_size,
+                processed=False
+            )
+            
+            # Insert file record
+            file_id = self.db_manager.insert_file(file_record)
+            
+            # Extract content
+            extraction_result = self.extractor.extract(file_path)
+            
+            chunks = []
+            
+            # Always add metadata chunk
+            metadata_text = self.create_metadata_chunk(file_path, file_type)
+            metadata_chunk = ChunkRecord(
+                id=None,
+                file_id=file_id,
+                chunk_text=metadata_text,
+                summary=f"Metadata for {file_path.name}",
+                chunk_type='metadata',
+                token_count=len(metadata_text.split()),
+                emb_id=None
+            )
+            chunks.append(metadata_chunk)
+            
+            # Add content chunks if extraction was successful
+            if extraction_result.success and extraction_result.content.strip():
+                text_chunks = self.chunker.chunk_text(
+                    extraction_result.content,
+                    source_info={'file_path': str(file_path), 'file_type': file_type}
+                )
+                
+                for chunk in text_chunks:
+                    summary = self._create_chunk_summary(chunk.text)
+                    chunk_record = ChunkRecord(
+                        id=None,
+                        file_id=file_id,
+                        chunk_text=chunk.text,
+                        summary=summary,
+                        chunk_type='content',
+                        token_count=chunk.token_count,
+                        emb_id=None
+                    )
+                    chunks.append(chunk_record)
+            
+            logger.info(f"Processed {file_path.name}: {len(chunks)} chunks")
+            return file_id, chunks
+            
+        except Exception as e:
+            logger.error(f"Failed to process {file_path}: {e}")
+            return -1, []
+    
+    def _create_chunk_summary(self, text: str, max_length: int = 200) -> str:
+        """Create a summary for a chunk."""
+        if len(text) <= max_length:
+            return text
+        
+        # Try to find a good break point
+        sentences = text.split('.')
+        if sentences and len(sentences[0]) <= max_length:
+            return sentences[0].strip() + '.'
+        
+        # Fallback to simple truncation
+        return text[:max_length - 3].strip() + '...'
+    
+    def build_index(self, rebuild: bool = False) -> bool:
+        """Build the semantic index from all files in the data directory."""
+        if rebuild:
+            logger.info("Rebuilding index from scratch...")
+            self.clear_index()
+        
+        # Find all files
+        if not self.data_path.exists():
+            logger.error(f"Data path does not exist: {self.data_path}")
+            return False
+        
+        files = [p for p in self.data_path.rglob("*") if p.is_file()]
+        if not files:
+            logger.warning("No files found to index")
+            return False
+        
+        logger.info(f"Found {len(files)} files to process")
+        
+        # Process files and collect chunks
+        all_chunks = []
+        all_chunk_texts = []
+        
+        for file_path in files:
+            file_id, chunks = self.process_file(file_path)
+            if file_id > 0 and chunks:
+                all_chunks.extend(chunks)
+                all_chunk_texts.extend([chunk.chunk_text for chunk in chunks])
+        
+        if not all_chunks:
+            logger.warning("No chunks generated from files")
+            return False
+        
+        logger.info(f"Generated {len(all_chunks)} total chunks")
+        
+        # Generate embeddings
+        embeddings = self.embedding_manager.create_embeddings(all_chunk_texts)
+        
+        # Build FAISS index
+        index = self.embedding_manager.build_faiss_index(embeddings)
+        
+        # Save FAISS index
+        self.embedding_manager.save_index(index)
+        
+        # Update chunk records with embedding IDs
+        for i, chunk in enumerate(all_chunks):
+            chunk.emb_id = i
+        
+        # Insert chunks into database
+        chunk_ids = self.db_manager.insert_chunks(all_chunks)
+        
+        # Update chunk links (prev/next relationships)
+        file_chunks = {}
+        for chunk_id, chunk in zip(chunk_ids, all_chunks):
+            if chunk.file_id not in file_chunks:
+                file_chunks[chunk.file_id] = []
+            file_chunks[chunk.file_id].append(chunk_id)
+        
+        for file_id, file_chunk_ids in file_chunks.items():
+            self.db_manager.update_chunk_links(file_chunk_ids)
+        
+        logger.info(f"Successfully built index with {len(all_chunks)} chunks")
+        return True
+    
+    def clear_index(self):
+        """Clear all index data."""
+        logger.info("Clearing existing index data...")
+        
+        # Clear database
+        self.db_manager.clear_all_data()
+        
+        # Remove FAISS index files
+        try:
+            for index_file in self.index_dir.glob("*.faiss"):
+                index_file.unlink()
+            for index_file in self.index_dir.glob("*.index"):
+                index_file.unlink()
+        except Exception as e:
+            logger.warning(f"Failed to remove some index files: {e}")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get indexing statistics."""
+        cursor = self.db_manager.conn.cursor()
+        
+        # File statistics
+        cursor.execute("SELECT COUNT(*) as total_files FROM files")
+        total_files = cursor.fetchone()['total_files']
+        
+        cursor.execute("SELECT file_type, COUNT(*) as count FROM files GROUP BY file_type")
+        files_by_type = {row['file_type']: row['count'] for row in cursor.fetchall()}
+        
+        # Chunk statistics
+        cursor.execute("SELECT COUNT(*) as total_chunks FROM chunks")
+        total_chunks = cursor.fetchone()['total_chunks']
+        
+        cursor.execute("SELECT chunk_type, COUNT(*) as count FROM chunks GROUP BY chunk_type")
+        chunks_by_type = {row['chunk_type']: row['count'] for row in cursor.fetchall()}
+        
+        cursor.execute("SELECT AVG(token_count) as avg_tokens FROM chunks WHERE token_count > 0")
+        avg_tokens = cursor.fetchone()['avg_tokens'] or 0
+        
+        return {
+            'total_files': total_files,
+            'files_by_type': files_by_type,
+            'total_chunks': total_chunks,
+            'chunks_by_type': chunks_by_type,
+            'average_tokens_per_chunk': round(avg_tokens, 2),
+            'embedding_dimension': self.embedding_manager.embedding_dim
+        }
+    
+    def close(self):
+        """Clean up resources."""
+        self.db_manager.close()
 
-        self.conn.commit()
-        logger.info(f"Indexed {len(files)} files with {len(chunk_texts)} chunks.")
+
+# Legacy compatibility class
+class Indexer(SemanticIndexer):
+    """Legacy indexer class for backward compatibility."""
+    
+    def __init__(self, data_path: str):
+        config = ConfigManager()
+        config.set('DATA_PATH', data_path)
+        super().__init__(config)
+    
+    def index_all(self):
+        """Legacy method for building index."""
+        return self.build_index(rebuild=True)
+    
+    def delete_index(self):
+        """Legacy method for clearing index."""
+        self.clear_index()
