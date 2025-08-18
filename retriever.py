@@ -154,7 +154,7 @@ class BM25Retriever:
         logger.info(f"BM25 index initialized with {len(chunks)} chunks")
     
     def search(self, query: str, top_k: int = 200) -> List[int]:
-        """Perform BM25 search and return chunk embedding IDs."""
+        """Perform BM25 search and return chunk IDs (not embedding IDs)."""
         if not BM25_AVAILABLE:
             return []
         
@@ -162,20 +162,32 @@ class BM25Retriever:
         if not self._initialized or self.bm25 is None:
             return []
         
-        # Tokenize query
-        query_tokens = query.lower().split()
-        
-        # Get BM25 scores
-        scores = self.bm25.get_scores(query_tokens)
-        
-        # Get top results
-        top_indices = np.argsort(scores)[::-1][:top_k]
-        
-        # Filter out zero scores
-        filtered_indices = [idx for idx in top_indices if scores[idx] > 0]
-        
-        # Return corresponding chunk IDs
-        return [self.chunk_ids[idx] for idx in filtered_indices]
+        try:
+            # Get all chunks from database (like original)
+            chunks = self.db_retriever.get_all_chunks()
+            if not chunks:
+                return []
+            
+            ids = [chunk_id for chunk_id, _ in chunks]
+            texts = [text for _, text in chunks]
+            
+            # Tokenize texts for BM25
+            tokenized = [text.split() for text in texts]
+            bm25 = BM25Okapi(tokenized)
+            
+            # Get BM25 scores
+            scores = bm25.get_scores(query.split())
+            
+            # Get top results
+            top_indices = np.argsort(scores)[::-1][:top_k]
+            
+            # Filter out zero scores and return chunk IDs (not embedding IDs)
+            pre_ids = [ids[i] for i in top_indices if scores[i] > 0]
+            return pre_ids
+            
+        except Exception as e:
+            logger.warning(f"BM25 search failed: {e}")
+            return []
 
 
 class DenseRetriever:
@@ -325,67 +337,106 @@ class SemanticRetriever:
         logger.info("SemanticRetriever initialized")
     
     def search(self, query: str, top_k: Optional[int] = None) -> List[SearchResult]:
-        """Perform hybrid search with optional reranking."""
+        """Perform hybrid search with optional reranking - using original algorithm."""
         if top_k is None:
             top_k = self.rerank_top_k
         
         logger.info(f"Searching for: '{query}' (top_k={top_k})")
         
-        # Step 1: BM25 prefiltering (optional)
-        candidate_ids = None
+        # Step 1: BM25 prefiltering (optional) - like original
+        pre_ids = None
         if BM25_AVAILABLE:
             try:
-                candidate_ids = self.bm25_retriever.search(query, self.bm25_top_k)
-                logger.debug(f"BM25 prefilter returned {len(candidate_ids)} candidates")
-            except Exception as e:
-                logger.warning(f"BM25 prefiltering failed: {e}")
+                pre_ids = self.bm25_retriever.search(query, self.bm25_top_k)
+                logger.debug(f"BM25 prefilter returned {len(pre_ids)} candidates")
+            except Exception:
+                logger.info("BM25 prefilter failed; skipping")
         
-        # Step 2: Dense retrieval
-        hit_indices, distances = self.dense_retriever.search(
-            query, self.dense_top_k, candidate_ids
-        )
+        # Step 2: Dense retrieval - exactly like original
+        query_vector = self.dense_retriever.embedder.encode([query], convert_to_numpy=True).astype("float32")
+        distances, indices = self.dense_retriever.index.search(query_vector, self.dense_top_k)
         
-        if not hit_indices:
+        hits = list(indices[0])
+        dists = list(distances[0])
+        
+        if not hits:
             logger.warning("No results found from dense retrieval")
             return []
         
-        logger.debug(f"Dense retrieval returned {len(hit_indices)} results")
+        logger.debug(f"Dense retrieval returned {len(hits)} results")
         
-        # Step 3: Convert to SearchResult objects
-        chunk_data = self.db_retriever.get_chunks_by_emb_ids(hit_indices)
-        chunk_lookup = {chunk['emb_id']: chunk for chunk in chunk_data}
-        
+        # Step 3: Map hit indices to database records - exactly like original
+        cursor = self.db_retriever.conn.cursor()
         results = []
-        for idx, distance in zip(hit_indices, distances):
-            chunk = chunk_lookup.get(idx)
-            if chunk:
-                # Convert distance to similarity score (lower distance = higher similarity)
-                score = 1.0 / (1.0 + distance) if distance >= 0 else 0.0
+        
+        for emb_id, dist in zip(hits, dists):
+            # Original mapping: emb_id is the FAISS index position
+            row = cursor.execute("""
+                SELECT id, file_id, chunk_text, summary, chunk_type 
+                FROM chunks WHERE emb_id=?
+            """, (int(emb_id),)).fetchone()
+            
+            if row:
+                chunk_id, file_id, text, summary, chunk_type = row
+                file_row = cursor.execute("SELECT path FROM files WHERE id=?", (file_id,)).fetchone()
+                path = file_row[0] if file_row else ""
                 
-                result = SearchResult(
-                    chunk_id=chunk['id'],
-                    file_id=chunk['file_id'],
-                    path=chunk['path'],
-                    text=chunk['chunk_text'],
-                    summary=chunk['summary'],
-                    chunk_type=chunk['chunk_type'],
-                    score=score,
-                    method='dense'
-                )
-                results.append(result)
+                results.append({
+                    "chunk_id": chunk_id,
+                    "file_id": file_id, 
+                    "path": path,
+                    "text": text,
+                    "score": float(dist),
+                    "summary": summary,
+                    "chunk_type": chunk_type
+                })
         
-        # Step 4: Reranking (optional)
-        if CROSS_ENCODER_AVAILABLE and len(results) > 1:
-            results = self.reranker.rerank(query, results, top_k * 2)  # Get more for reranking
+        # Step 4: Re-rank with cross-encoder if available - exactly like original
+        if CROSS_ENCODER_AVAILABLE and self.reranker.cross_encoder and results:
+            try:
+                pairs = [[query, r["text"][:512]] for r in results[:self.rerank_top_k*2]]
+                scores = self.reranker.cross_encoder.predict(pairs)
+                
+                for i, s in enumerate(scores):
+                    if i < len(results):
+                        results[i]["cross_score"] = float(s)
+                
+                # Sort by cross-encoder score (higher = better)
+                results.sort(key=lambda r: r.get("cross_score", r["score"]), reverse=True)
+            except Exception as e:
+                logger.error(f"Cross-encoder reranking failed: {e}")
+                # Fallback: sort by distance (lower = better) - like original
+                results = sorted(results, key=lambda r: r["score"])
+        else:
+            # Sort by distance (lower = better) - like original
+            results = sorted(results, key=lambda r: r["score"])
         
-        # Step 5: Final filtering and sorting
-        results = results[:top_k]
+        # Step 5: Convert to SearchResult objects and return top results
+        search_results = []
+        for r in results[:top_k]:
+            result = SearchResult(
+                chunk_id=r["chunk_id"],
+                file_id=r["file_id"],
+                path=r["path"],
+                text=r["text"],
+                summary=r["summary"],
+                chunk_type=r.get("chunk_type", "content"),
+                score=r["score"],
+                method='dense'
+            )
+            if "cross_score" in r:
+                result.cross_score = r["cross_score"]
+                result.final_score = r["cross_score"]
+            search_results.append(result)
         
         # Log search
-        self.db_retriever.log_search(query, len(results))
+        try:
+            self.db_retriever.log_search(query, len(search_results))
+        except Exception:
+            pass
         
-        logger.info(f"Search completed: {len(results)} results returned")
-        return results
+        logger.info(f"Search completed: {len(search_results)} results returned")
+        return search_results
     
     def get_similar_chunks(self, chunk_id: int, top_k: int = 5) -> List[SearchResult]:
         """Find chunks similar to a given chunk."""
@@ -459,17 +510,104 @@ class SemanticRetriever:
         self.db_retriever.close()
 
 
-# Legacy compatibility class
-class Retriever(SemanticRetriever):
-    """Legacy retriever class for backward compatibility."""
+# Legacy compatibility class - exactly like original
+class Retriever:
+    """Legacy retriever class for backward compatibility - matches original exactly."""
     
     def __init__(self):
-        super().__init__()
-    
-    def search(self, query: str, topk: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Legacy search method returning dictionaries."""
-        if topk is None:
-            topk = self.rerank_top_k
+        from utils import ConfigManager
         
-        results = super().search(query, topk)
-        return [result.to_dict() for result in results]
+        config = ConfigManager()
+        db_path = config.get("SQLITE_DB", "index.db")
+        index_dir = config.get("INDEX_DIR", "./indices")
+        embed_model = config.get("EMBED_MODEL", "all-MiniLM-L6-v2")
+        cross_model = config.get("CROSS_ENCODER", "cross-encoder/ms-marco-TinyBERT-L-2-v2")
+        
+        self.conn = sqlite3.connect(db_path)
+        self.embedder = SentenceTransformer(embed_model)
+        self.dim = self.embedder.get_sentence_embedding_dimension()
+        
+        # Load FAISS - try different possible names
+        idx_path = f"{index_dir}/chunks_ivfpq.index"
+        if not Path(idx_path).exists():
+            idx_path = f"{index_dir}/chunks_index.faiss"
+        
+        if not Path(idx_path).exists():
+            raise FileNotFoundError(f"FAISS index not found at {idx_path}")
+        
+        self.index = faiss.read_index(idx_path)
+        
+        # Load cross encoder lazily
+        try:
+            self.cross = CrossEncoder(cross_model)
+        except Exception:
+            self.cross = None
+    
+    def _load_all_chunk_texts(self):
+        """Load all chunk texts - like original."""
+        c = self.conn.cursor()
+        rows = c.execute("SELECT id, chunk_text FROM chunks").fetchall()
+        ids = [r[0] for r in rows]
+        texts = [r[1] for r in rows]
+        return ids, texts
+    
+    def bm25_prefilter(self, query, topk=200):
+        """BM25 prefiltering - like original."""
+        if not BM25_AVAILABLE:
+            return []
+        
+        ids, texts = self._load_all_chunk_texts()
+        tokenized = [t.split() for t in texts]
+        bm25 = BM25Okapi(tokenized)
+        scores = bm25.get_scores(query.split())
+        top_idx = np.argsort(scores)[::-1][:topk]
+        pre_ids = [ids[i] for i in top_idx if scores[i] > 0]
+        return pre_ids
+    
+    def dense_search(self, query, candidate_ids=None, topk=50):
+        """Dense search - like original."""
+        qv = self.embedder.encode([query], convert_to_numpy=True).astype("float32")
+        D, I = self.index.search(qv, topk)
+        hits = list(I[0])
+        return hits, list(D[0])
+    
+    def search(self, query: str, topk: int = 5) -> List[Dict[str, Any]]:
+        """Search method - exactly like original."""
+        # Two-pass: BM25 -> Dense -> Rerank
+        pre_ids = None
+        try:
+            pre_ids = self.bm25_prefilter(query)
+        except Exception:
+            logger.info("BM25 prefilter failed; skipping")
+        
+        hits, dists = self.dense_search(query, candidate_ids=pre_ids, topk=50)
+        
+        # Map hit ids to chunk ids stored in SQLite
+        c = self.conn.cursor()
+        results = []
+        for emb_id, dist in zip(hits, dists):
+            row = c.execute("SELECT id, file_id, chunk_text, summary FROM chunks WHERE emb_id=?", (int(emb_id),)).fetchone()
+            if row:
+                chunk_id, file_id, text, summary = row
+                file_row = c.execute("SELECT path FROM files WHERE id=?", (file_id,)).fetchone()
+                path = file_row[0] if file_row else ""
+                results.append({
+                    "chunk_id": chunk_id, 
+                    "file_id": file_id, 
+                    "path": path, 
+                    "text": text, 
+                    "score": float(dist), 
+                    "summary": summary
+                })
+        
+        # Re-rank with cross-encoder if available
+        if self.cross and results:
+            pairs = [[query, r["text"][:512]] for r in results[:topk*2]]
+            scores = self.cross.predict(pairs)
+            for i, s in enumerate(scores):
+                results[i]["cross_score"] = float(s)
+            results.sort(key=lambda r: r.get("cross_score", r["score"]), reverse=True)
+        else:
+            results = sorted(results, key=lambda r: r["score"])
+        
+        return results[:topk]
