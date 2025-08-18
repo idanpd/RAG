@@ -1,0 +1,37 @@
+# Paths
+DATA_PATH: C:\Users\Hana\Pictures\test
+INDEX_DIR: ./indices
+SQLITE_DB: index.db
+
+# Embeddings
+EMBED_MODEL: all-MiniLM-L6-v2
+CHUNK_SIZE: 500
+CHUNK_OVERLAP: 100
+FAISS_NLIST: 100
+FAISS_PQ_M: 8
+# Retriever
+RERANK_TOPK: 3
+
+# LLM
+LLM_MODEL_PATH: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+LLM_FAMILY: llama         # options: llama | gemma
+LLM_CTX: 2048
+LLM_THREADS: 4
+LLM_N_BATCH: 256
+LLM_TEMP: 0.3
+LLM_MAX_TOKENS: 512
+
+# Image & Video extraction
+USE_OCR: true
+USE_IMAGE_CAPTION: true          # enable tiny CPU captioning
+IMAGE_CAPTION_MODEL: Salesforce/blip-image-captioning-base
+USE_VIDEO_TRANSCRIPT: false      # set true if whisper.cpp available
+WHISPER_CPP_BIN: ""              # e.g., ./whisper.cpp/main
+WHISPER_MODEL: ""                # e.g., ggml-base.en.bin
+
+USE_VIDEO_KEYFRAME_OCR: true
+KEYFRAME_EVERY_SEC: 3
+KEYFRAME_MAX: 10
+
+# Logging
+LOG_LEVEL: INFO
