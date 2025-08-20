@@ -289,13 +289,20 @@ class SemanticSearchSystem:
             if hasattr(result, 'to_dict'):
                 result = result.to_dict()
             
-            score = result.get('final_score', result.get('score', 0))
+            # Handle scoring - cross_score takes precedence, then distance
+            if 'cross_score' in result and result['cross_score'] is not None:
+                score = result['cross_score']
+                score_type = "Cross-Encoder"
+            else:
+                score = result.get('score', 0)
+                score_type = "Distance"
+            
             path = result.get('path', 'Unknown')
             summary = result.get('summary', '')
             chunk_type = result.get('chunk_type', 'content')
             
             print(f"{i}. [{chunk_type.upper()}] {Path(path).name}")
-            print(f"   Score: {score:.4f}")
+            print(f"   {score_type}: {score:.4f}")
             print(f"   Path: {path}")
             if summary:
                 print(f"   Summary: {summary}")
