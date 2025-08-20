@@ -9,13 +9,13 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Union, Tuple
 import logging
 from dataclasses import dataclass
-
 import faiss
 from sentence_transformers import SentenceTransformer
 
 from utils import ConfigManager, ensure_dir, file_sha256
 from chunker import SemanticChunker, TextChunk
-from extractors import MultiExtractor, TextExtractor, ImageExtractor, VideoExtractor
+from extractors import  TextExtractor, ImageExtractor, VideoExtractor
+from extractors.base import MultiExtractor
 
 logger = logging.getLogger(__name__)
 

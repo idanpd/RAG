@@ -31,7 +31,7 @@ MODELS = {
         'sha256': None
     },
     'phi3-mini-instruct': {
-        'filename': 'phi-3-mini-4k-instruct-q4.gguf',
+        'filename': 'Phi-3.5-mini-instruct-Q4_K_M.gguf',
         'url': 'https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf',
         'size_mb': 2200,
         'description': 'Phi-3 Mini 3.8B - High quality reasoning',

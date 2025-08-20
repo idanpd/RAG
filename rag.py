@@ -348,17 +348,7 @@ class PromptTemplate:
     """Template for RAG prompts with different styles."""
     
     TEMPLATES = {
-        'default': """You are a helpful assistant. Answer the question using only the provided contexts and cite file paths.
-
-CONTEXTS:
-{context}
-
-QUESTION:
-{query}
-
-Answer concisely and include citations like [file:path].""",
-        
-        'detailed': """You are an expert assistant. Based on the provided contexts, give a comprehensive answer to the question.
+        'default': """You are a helpful expert assistant. Answer the question using only the provided contexts.
 
 CONTEXTS:
 {context}
@@ -367,39 +357,11 @@ QUESTION:
 {query}
 
 Instructions:
-- Use only the information from the provided contexts
-- Be thorough and detailed in your response
-- Cite sources using [file:filename] format
-- If the contexts don't contain relevant information, say so clearly
+- Provide a clear and comprehensive summary of the answer
+- Always include citations in the format [file:filename or file:path]
 
-ANSWER:""",
-        
-        'concise': """Answer briefly using only the provided contexts.
-
-CONTEXTS:
-{context}
-
-QUESTION: {query}
-
-BRIEF ANSWER:""",
-        
-        'analytical': """You are an analytical assistant. Analyze the provided contexts to answer the question.
-
-CONTEXTS:
-{context}
-
-QUESTION:
-{query}
-
-Please provide:
-1. A direct answer to the question
-2. Supporting evidence from the contexts
-3. Any limitations or gaps in the available information
-
-Use [file:filename] to cite sources.
-
-ANALYSIS:"""
-    }
+FINAL ANSWER:"""
+}
     
     @classmethod
     def build_prompt(cls, query: str, results: List[Dict[str, Any]], 
