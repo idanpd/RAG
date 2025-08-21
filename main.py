@@ -10,6 +10,7 @@ with LLM-powered answers.
 import sys
 import argparse
 import logging
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -325,6 +326,157 @@ class SemanticSearchSystem:
         print(f"\n🔧 Generated using: {result['llm_used']} | Template: {result['template_used']}")
         print("=" * 50)
     
+    def conversation_mode(self):
+        """Run in conversational mode with memory."""
+        print("\n🤖 Conversational RAG Mode - Industry-Grade Chat with Memory")
+        print("=" * 60)
+        
+        # Initialize conversational RAG system
+        try:
+            from conversational_rag import ConversationalRAG
+            conv_rag = ConversationalRAG(self.config)
+            print("✅ Conversational RAG system initialized")
+        except Exception as e:
+            print(f"❌ Failed to initialize conversational RAG: {e}")
+            return
+        
+        # Check if index exists
+        try:
+            retriever = self.initialize_retriever()
+            if retriever.dense_retriever.index is None:
+                print("\n⚠️  No search index found. Please build the index first.")
+                print("Run: python main.py --build-index")
+                return
+        except Exception as e:
+            print(f"\n❌ Error initializing retriever: {e}")
+            return
+        
+        # Show available models
+        available_models = conv_rag.llm_manager.get_available_models()
+        if available_models:
+            print(f"\n🤖 Available models: {len(available_models)}")
+            for model in available_models:
+                status = "🔥 LOADED" if model['is_loaded'] else "💤 Available"
+                print(f"  - {model['name']}: {model['description']} ({status})")
+        
+        print("\n📖 Commands:")
+        print("  - Type your message to chat")
+        print("  - 'new' - Start a new conversation")
+        print("  - 'list' - List conversations")
+        print("  - 'load <id>' - Load a conversation")
+        print("  - 'model <name>' - Switch model")
+        print("  - 'debug' - Toggle debug mode")
+        print("  - 'quit' - Exit")
+        print()
+        
+        # Initialize conversation
+        current_conversation_id = conv_rag.create_conversation("CLI Conversation")
+        print(f"🆕 Started new conversation: {current_conversation_id[:8]}...")
+        
+        debug_mode = False
+        
+        while True:
+            try:
+                user_input = input("\n💬 You: ").strip()
+                
+                if not user_input:
+                    continue
+                
+                if user_input.lower() in ['quit', 'exit', 'q']:
+                    print("Goodbye! 👋")
+                    break
+                
+                elif user_input.lower() == 'new':
+                    current_conversation_id = conv_rag.create_conversation("CLI Conversation")
+                    print(f"🆕 Started new conversation: {current_conversation_id[:8]}...")
+                    continue
+                
+                elif user_input.lower() == 'list':
+                    conversations = conv_rag.get_conversations()
+                    print(f"\n📋 Conversations ({len(conversations)}):")
+                    for conv in conversations[:10]:
+                        status = "🔥" if conv['id'] == current_conversation_id else "💬"
+                        print(f"  {status} {conv['id'][:8]}: {conv['title']} ({conv['message_count']} messages)")
+                    continue
+                
+                elif user_input.lower().startswith('load '):
+                    conv_id_prefix = user_input[5:].strip()
+                    conversations = conv_rag.get_conversations()
+                    matching_conv = None
+                    for conv in conversations:
+                        if conv['id'].startswith(conv_id_prefix):
+                            matching_conv = conv
+                            break
+                    
+                    if matching_conv:
+                        current_conversation_id = matching_conv['id']
+                        print(f"📂 Loaded conversation: {matching_conv['title']}")
+                        
+                        # Show recent history
+                        history = conv_rag.get_conversation_history(current_conversation_id, limit=6)
+                        if history:
+                            print("Recent history:")
+                            for msg in history[-6:]:
+                                role = "You" if msg.type == 'user_msg' else "Assistant"
+                                content = msg.content[:100] + "..." if len(msg.content) > 100 else msg.content
+                                print(f"  {role}: {content}")
+                    else:
+                        print(f"❌ No conversation found starting with '{conv_id_prefix}'")
+                    continue
+                
+                elif user_input.lower().startswith('model '):
+                    model_name = user_input[6:].strip()
+                    if conv_rag.llm_manager.set_active_llm(model_name):
+                        print(f"✅ Switched to model: {model_name}")
+                    else:
+                        print(f"❌ Model not available: {model_name}")
+                    continue
+                
+                elif user_input.lower() == 'debug':
+                    debug_mode = not debug_mode
+                    print(f"🔍 Debug mode: {'ON' if debug_mode else 'OFF'}")
+                    continue
+                
+                # Process conversation turn
+                print("🤔 Thinking...")
+                start_time = time.time()
+                
+                turn = conv_rag.process_user_message(current_conversation_id, user_input)
+                
+                processing_time = time.time() - start_time
+                
+                # Display response
+                print(f"\n🤖 Assistant: {turn.assistant_message.content}")
+                
+                # Show metadata
+                print(f"\n📊 Confidence: {turn.confidence:.2f} | "
+                      f"Citations: {len(turn.citations or [])} | "
+                      f"Time: {turn.total_time:.2f}s")
+                
+                # Debug information
+                if debug_mode:
+                    print(f"\n🔍 Debug Info:")
+                    print(f"  - Documents retrieved: {len(turn.doc_results)}")
+                    print(f"  - Memory items: {len(turn.memory_results)}")
+                    print(f"  - Generation time: {turn.generation_time:.2f}s")
+                    print(f"  - Prompt tokens: {turn.prompt_metadata.get('total_tokens', 0)}")
+                    print(f"  - Token budget used: {turn.prompt_metadata.get('trimming_applied', False)}")
+                    
+                    if turn.citations:
+                        print(f"  - Citations: {', '.join(turn.citations)}")
+                
+            except KeyboardInterrupt:
+                print("\nGoodbye! 👋")
+                break
+            except Exception as e:
+                print(f"❌ Error: {e}")
+                if debug_mode:
+                    import traceback
+                    traceback.print_exc()
+        
+        # Cleanup
+        conv_rag.cleanup()
+    
     def cleanup(self):
         """Clean up resources."""
         if self.indexer:
@@ -344,7 +496,8 @@ def main():
 Examples:
   python main.py --build-index                    # Build search index
   python main.py --rebuild-index                  # Rebuild from scratch
-  python main.py --interactive                    # Interactive mode
+  python main.py --interactive                    # Interactive mode (simple)
+  python main.py --conversation                   # Conversational mode with memory
   python main.py --search "your query"            # One-time search
   python main.py --ask "your question"            # One-time Q&A
   python main.py --models                         # List available models
@@ -361,6 +514,8 @@ Examples:
                        help='Rebuild the search index from scratch')
     parser.add_argument('--interactive', '-i', action='store_true',
                        help='Run in interactive mode')
+    parser.add_argument('--conversation', action='store_true',
+                       help='Run in conversational mode with memory')
     parser.add_argument('--search', '-s', type=str,
                        help='Perform a one-time search')
     parser.add_argument('--ask', '-a', type=str,
@@ -454,6 +609,10 @@ Examples:
         
         elif args.interactive:
             system.interactive_mode()
+            return 0
+        
+        elif args.conversation:
+            system.conversation_mode()
             return 0
         
         else:

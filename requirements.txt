@@ -40,6 +40,9 @@ requests>=2.28.0  # For Ollama API and model downloads
 # Optional: Token counting
 tiktoken>=0.4.0
 
+# Web UI
+streamlit>=1.28.0
+
 # Development/Testing (optional)
 pytest>=7.0.0
 black>=22.0.0
