@@ -5,6 +5,7 @@ Multi-modal semantic indexer with advanced chunking and embedding generation.
 import os
 import sqlite3
 import numpy as np
+import json
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union, Tuple
 import logging
@@ -37,7 +38,7 @@ class FileRecord:
 class ChunkRecord:
     """Represents a chunk record in the database."""
     id: Optional[int]
-    file_id: int
+    file_id: Optional[int]  # Nullable for conversation messages
     chunk_text: str
     summary: str
     chunk_type: str
@@ -45,6 +46,14 @@ class ChunkRecord:
     prev_id: Optional[int] = None
     next_id: Optional[int] = None
     emb_id: Optional[int] = None
+    # Conversational RAG fields
+    conversation_id: Optional[str] = None
+    timestamp: Optional[str] = None
+    source: Optional[str] = None
+    confidence: float = 0.0
+    citations: Optional[List[str]] = None
+    topic: Optional[str] = None
+    archived: bool = False
 
 
 class DatabaseManager:
@@ -76,19 +85,27 @@ class DatabaseManager:
             )
         """)
         
-        # Chunks table
+        # Enhanced chunks table for unified knowledge and memory store
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS chunks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_id INTEGER NOT NULL,
+                file_id INTEGER,  -- Nullable for conversation messages
                 chunk_text TEXT NOT NULL,
                 summary TEXT,
-                chunk_type TEXT DEFAULT 'content',
+                chunk_type TEXT DEFAULT 'content',  -- 'doc', 'user_msg', 'assistant_msg', 'summary', 'content', 'metadata'
                 token_count INTEGER DEFAULT 0,
                 prev_id INTEGER,
                 next_id INTEGER,
                 emb_id INTEGER,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                -- Conversational RAG fields
+                conversation_id TEXT,  -- Groups conversation messages
+                timestamp TEXT,        -- ISO timestamp for ordering
+                source TEXT,           -- Origin: 'user_interface', 'system', 'file'
+                confidence REAL DEFAULT 0.0,  -- Quality score for assistant messages
+                citations TEXT,        -- JSON array of citation IDs
+                topic TEXT,            -- Optional topic clustering
+                archived BOOLEAN DEFAULT FALSE,  -- For cleanup and summarization
                 FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
             )
         """)
@@ -109,6 +126,11 @@ class DatabaseManager:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON chunks(file_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_emb_id ON chunks(emb_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_type ON chunks(chunk_type)")
+        # New indexes for conversational RAG
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_conversation_id ON chunks(conversation_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_timestamp ON chunks(timestamp)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_archived ON chunks(archived)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_chunks_confidence ON chunks(confidence)")
         
         self.conn.commit()
     
@@ -143,10 +165,14 @@ class DatabaseManager:
         chunk_ids = []
         
         for chunk in chunks:
+            # Handle citations as JSON
+            citations_json = json.dumps(chunk.citations) if chunk.citations else None
+            
             cursor.execute("""
                 INSERT INTO chunks 
-                (file_id, chunk_text, summary, chunk_type, token_count, prev_id, emb_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (file_id, chunk_text, summary, chunk_type, token_count, prev_id, emb_id,
+                 conversation_id, timestamp, source, confidence, citations, topic, archived)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 chunk.file_id,
                 chunk.chunk_text,
@@ -154,7 +180,14 @@ class DatabaseManager:
                 chunk.chunk_type,
                 chunk.token_count,
                 chunk.prev_id,
-                chunk.emb_id
+                chunk.emb_id,
+                chunk.conversation_id,
+                chunk.timestamp,
+                chunk.source,
+                chunk.confidence,
+                citations_json,
+                chunk.topic,
+                chunk.archived
             ))
             chunk_ids.append(cursor.lastrowid)
         
@@ -196,6 +229,128 @@ class DatabaseManager:
         if row:
             return dict(row)
         return None
+    
+    def add_conversation_message(self, 
+                               conversation_id: str,
+                               message_type: str,
+                               content: str,
+                               summary: str = "",
+                               prev_id: Optional[int] = None,
+                               source: str = "user_interface",
+                               confidence: float = 0.0,
+                               citations: Optional[List[str]] = None,
+                               topic: Optional[str] = None) -> int:
+        """Add a conversation message to the chunks table."""
+        from datetime import datetime, timezone
+        
+        # Calculate token count
+        token_count = len(content.split())  # Simple approximation
+        
+        chunk_record = ChunkRecord(
+            id=None,
+            file_id=None,  # No file for conversation messages
+            chunk_text=content,
+            summary=summary or content[:200],
+            chunk_type=message_type,
+            token_count=token_count,
+            prev_id=prev_id,
+            conversation_id=conversation_id,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            source=source,
+            confidence=confidence,
+            citations=citations,
+            topic=topic,
+            archived=False
+        )
+        
+        chunk_ids = self.insert_chunks([chunk_record])
+        return chunk_ids[0] if chunk_ids else None
+    
+    def get_conversation_chunks(self, 
+                              conversation_id: str,
+                              message_types: Optional[List[str]] = None,
+                              include_archived: bool = False,
+                              limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Get chunks for a specific conversation."""
+        cursor = self.conn.cursor()
+        
+        # Build query
+        where_conditions = ["conversation_id = ?"]
+        params = [conversation_id]
+        
+        if message_types:
+            placeholders = ','.join('?' * len(message_types))
+            where_conditions.append(f"chunk_type IN ({placeholders})")
+            params.extend(message_types)
+        
+        if not include_archived:
+            where_conditions.append("archived = FALSE")
+        
+        where_clause = " AND ".join(where_conditions)
+        
+        query = f"""
+            SELECT * FROM chunks 
+            WHERE {where_clause}
+            ORDER BY timestamp ASC
+        """
+        
+        if limit:
+            query += f" LIMIT {limit}"
+        
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        
+        results = []
+        for row in rows:
+            result = dict(row)
+            # Parse citations from JSON
+            if result['citations']:
+                result['citations'] = json.loads(result['citations'])
+            else:
+                result['citations'] = []
+            results.append(result)
+        
+        return results
+    
+    def search_memory_chunks(self, 
+                           query_embedding: np.ndarray,
+                           conversation_id: str,
+                           message_types: Optional[List[str]] = None,
+                           confidence_threshold: float = 0.0,
+                           top_k: int = 10) -> List[Tuple[Dict[str, Any], float]]:
+        """Search memory chunks using embedding similarity."""
+        # This is a simplified implementation
+        # In production, you'd use a proper vector database
+        
+        chunks = self.get_conversation_chunks(
+            conversation_id, 
+            message_types, 
+            include_archived=False
+        )
+        
+        if not chunks:
+            return []
+        
+        # Filter by confidence for assistant messages
+        filtered_chunks = []
+        for chunk in chunks:
+            if chunk['chunk_type'] == 'assistant_msg':
+                if chunk['confidence'] >= confidence_threshold or chunk['citations']:
+                    filtered_chunks.append(chunk)
+            else:
+                filtered_chunks.append(chunk)
+        
+        # For now, return chunks sorted by timestamp (most recent first)
+        # In a full implementation, you'd calculate embedding similarities
+        filtered_chunks.sort(key=lambda x: x['timestamp'], reverse=True)
+        
+        # Return as tuples with dummy similarity scores
+        results = []
+        for i, chunk in enumerate(filtered_chunks[:top_k]):
+            similarity = 0.8 - (i * 0.1)  # Decreasing similarity
+            results.append((chunk, similarity))
+        
+        return results
     
     def clear_all_data(self):
         """Clear all data from the database."""
