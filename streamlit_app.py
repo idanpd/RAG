@@ -23,40 +23,102 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for better chat UI
+# Custom CSS for better chat UI with white background and black text
 st.markdown("""
 <style>
+/* Force white background and black text */
+.stApp {
+    background-color: white !important;
+    color: black !important;
+}
+
+.main .block-container {
+    background-color: white !important;
+    color: black !important;
+}
+
+/* Chat message styling */
 .chat-message {
     padding: 1rem;
     border-radius: 0.5rem;
     margin-bottom: 1rem;
     display: flex;
     flex-direction: column;
+    background-color: white !important;
+    color: black !important;
+    border: 1px solid #ddd;
 }
+
 .user-message {
-    background-color: #e3f2fd;
-    margin-left: 20%;
+    background-color: #e3f2fd !important;
+    margin-left: 15%;
+    color: black !important;
 }
+
 .assistant-message {
-    background-color: #f5f5f5;
-    margin-right: 20%;
+    background-color: #f8f9fa !important;
+    margin-right: 15%;
+    color: black !important;
 }
+
 .message-meta {
     font-size: 0.8rem;
-    color: #666;
+    color: #666 !important;
     margin-top: 0.5rem;
 }
-.conversation-item {
-    padding: 0.5rem;
+
+/* Sidebar styling */
+.css-1d391kg {
+    background-color: #f8f9fa !important;
+}
+
+/* Input styling */
+.stTextInput > div > div > input {
+    background-color: white !important;
+    color: black !important;
+    border: 1px solid #ddd !important;
+}
+
+.stChatInput > div > div > input {
+    background-color: white !important;
+    color: black !important;
+    border: 1px solid #ddd !important;
+}
+
+/* Button styling */
+.stButton > button {
+    background-color: #007bff !important;
+    color: white !important;
+    border: none !important;
+}
+
+.stButton > button:hover {
+    background-color: #0056b3 !important;
+}
+
+/* File uploader styling */
+.stFileUploader {
+    background-color: white !important;
+    color: black !important;
+    border: 2px dashed #007bff !important;
+    border-radius: 0.5rem;
+    padding: 1rem;
+}
+
+/* Metrics styling */
+.metric-container {
+    background-color: white !important;
+    color: black !important;
+    border: 1px solid #ddd;
     border-radius: 0.25rem;
-    margin-bottom: 0.5rem;
-    cursor: pointer;
+    padding: 0.5rem;
 }
-.conversation-item:hover {
-    background-color: #f0f0f0;
-}
-.active-conversation {
-    background-color: #e3f2fd;
+
+/* Debug info styling */
+.stExpander {
+    background-color: white !important;
+    color: black !important;
+    border: 1px solid #ddd;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -66,33 +128,55 @@ st.markdown("""
 def initialize_system():
     """Initialize the conversational RAG system."""
     try:
+        from utils import ConfigManager
+        from indexer import SemanticIndexer
+        from retriever import SemanticRetriever
+        from rag import LocalLLMManager
+        from model_api import LocalModelAPI
+        
         config = ConfigManager()
-        rag_system = ConversationalRAG(config)
+        
+        # Initialize core components
+        indexer = SemanticIndexer(config)
+        retriever = SemanticRetriever(config)
+        llm_manager = LocalLLMManager(config)
         model_api = LocalModelAPI(config)
-        return rag_system, model_api, None
+        
+        return {
+            'indexer': indexer,
+            'retriever': retriever, 
+            'llm_manager': llm_manager,
+            'model_api': model_api,
+            'config': config
+        }, None
     except Exception as e:
-        return None, None, str(e)
+        return None, str(e)
 
 
 def initialize_session_state():
     """Initialize Streamlit session state."""
-    if "rag_system" not in st.session_state:
-        rag_system, model_api, error = initialize_system()
-        st.session_state.rag_system = rag_system
-        st.session_state.model_api = model_api
+    if "system" not in st.session_state:
+        system, error = initialize_system()
+        st.session_state.system = system
         st.session_state.init_error = error
     
     if "current_conversation_id" not in st.session_state:
         st.session_state.current_conversation_id = None
     
     if "conversations" not in st.session_state:
-        st.session_state.conversations = []
+        st.session_state.conversations = {}
     
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
     
     if "show_debug" not in st.session_state:
         st.session_state.show_debug = False
+    
+    if "uploaded_files" not in st.session_state:
+        st.session_state.uploaded_files = []
+    
+    if "index_needs_rebuild" not in st.session_state:
+        st.session_state.index_needs_rebuild = False
 
 
 def load_conversations():
