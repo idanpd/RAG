@@ -3,6 +3,7 @@ Advanced retrieval system with hybrid search and reranking capabilities.
 """
 
 import sqlite3
+import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import logging
@@ -315,7 +316,7 @@ class CrossEncoderReranker:
 
 
 class SemanticRetriever:
-    """Main retriever class with hybrid search capabilities."""
+    """Main retriever class with hybrid search capabilities and conversation support."""
     
     def __init__(self, config: Optional[ConfigManager] = None):
         self.config = config or ConfigManager()
@@ -333,6 +334,11 @@ class SemanticRetriever:
         self.bm25_top_k = self.config.get('BM25_TOPK', 200)
         self.dense_top_k = self.config.get('DENSE_TOPK', 50)
         self.rerank_top_k = self.config.get('RERANK_TOPK', 5)
+        
+        # Conversation settings
+        self.doc_search_k = self.config.get('DOC_SEARCH_K', 8)
+        self.memory_search_k = self.config.get('MEMORY_SEARCH_K', 6)
+        self.confidence_threshold = self.config.get('CONFIDENCE_THRESHOLD', 0.7)
         
         logger.info("SemanticRetriever initialized")
     
@@ -504,6 +510,96 @@ class SemanticRetriever:
             results.append(result)
         
         return results
+    
+    def search_docs(self, query: str, top_k: Optional[int] = None) -> List[SearchResult]:
+        """Search documents only (type='doc' or legacy content types)."""
+        if top_k is None:
+            top_k = self.doc_search_k
+        
+        # Use the existing search but filter for document types
+        all_results = self.search(query, top_k * 2)  # Get more to filter
+        
+        # Filter for document chunks
+        doc_results = []
+        for result in all_results:
+            # Include chunks that are documents (not conversation messages)
+            if (hasattr(result, 'chunk_type') and 
+                result.chunk_type in ['doc', 'content', 'metadata']) or \
+               (isinstance(result, dict) and 
+                result.get('chunk_type') in ['doc', 'content', 'metadata']):
+                doc_results.append(result)
+                if len(doc_results) >= top_k:
+                    break
+        
+        return doc_results
+    
+    def search_memory(self, query: str, conversation_id: str, top_k: Optional[int] = None) -> List[SearchResult]:
+        """Search conversation memory only."""
+        if top_k is None:
+            top_k = self.memory_search_k
+        
+        if not conversation_id:
+            return []
+        
+        # Search for conversation messages
+        cursor = self.db_retriever.conn.cursor()
+        cursor.execute("""
+            SELECT c.id, c.file_id, c.chunk_text, c.summary, c.chunk_type,
+                   c.conversation_id, c.timestamp, c.confidence, c.citations,
+                   COALESCE(f.path, 'conversation') as path
+            FROM chunks c
+            LEFT JOIN files f ON c.file_id = f.id
+            WHERE c.conversation_id = ? 
+            AND c.chunk_type IN ('assistant_msg', 'user_msg', 'summary')
+            AND c.archived = FALSE
+            AND (c.chunk_type != 'assistant_msg' OR c.confidence >= ? OR c.citations IS NOT NULL)
+            ORDER BY c.timestamp DESC
+            LIMIT ?
+        """, (conversation_id, self.confidence_threshold, top_k))
+        
+        results = []
+        for row in cursor.fetchall():
+            # Parse citations
+            citations = []
+            if row[8]:  # citations column
+                try:
+                    citations = json.loads(row[8])
+                except:
+                    citations = []
+            
+            result = SearchResult(
+                chunk_id=row[0],
+                file_id=row[1] or -1,
+                path=row[9],
+                text=row[2],
+                summary=row[3],
+                chunk_type=row[4],
+                score=1.0,  # Memory items have uniform score for now
+                method='memory'
+            )
+            results.append(result)
+        
+        return results
+    
+    def search_dual(self, query: str, conversation_id: Optional[str] = None, 
+                   doc_k: Optional[int] = None, memory_k: Optional[int] = None) -> Tuple[List[SearchResult], List[SearchResult]]:
+        """
+        Dual retrieval: Search both documents and conversation memory.
+        This is the key method for conversational RAG.
+        """
+        doc_k = doc_k or self.doc_search_k
+        memory_k = memory_k or self.memory_search_k
+        
+        # Search documents (all indexed documents from DATA_PATH)
+        doc_results = self.search_docs(query, doc_k)
+        
+        # Search conversation memory if conversation_id provided
+        memory_results = []
+        if conversation_id:
+            memory_results = self.search_memory(query, conversation_id, memory_k)
+        
+        logger.info(f"Dual search: {len(doc_results)} docs + {len(memory_results)} memory items")
+        return doc_results, memory_results
     
     def close(self):
         """Clean up resources."""

@@ -396,19 +396,94 @@ FINAL ANSWER:"""
         )
 
 
+class ConversationManager:
+    """Manages conversation state and memory using existing database."""
+    
+    def __init__(self, db_retriever, config: ConfigManager):
+        self.db_retriever = db_retriever
+        self.config = config
+        self.summarization_threshold = config.get('SUMMARIZATION_THRESHOLD', 10)
+        
+    def add_message(self, conversation_id: str, message_type: str, content: str, 
+                   prev_id: Optional[int] = None, confidence: float = 0.5, 
+                   citations: Optional[List[str]] = None) -> int:
+        """Add a conversation message to the chunks table."""
+        import uuid
+        from datetime import datetime, timezone
+        
+        cursor = self.db_retriever.conn.cursor()
+        
+        # Calculate token count
+        token_count = len(content.split())
+        citations_json = json.dumps(citations) if citations else None
+        
+        cursor.execute("""
+            INSERT INTO chunks 
+            (file_id, chunk_text, summary, chunk_type, token_count, prev_id,
+             conversation_id, timestamp, source, confidence, citations, archived)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            None,  # No file for conversation messages
+            content,
+            content[:200],  # Summary
+            message_type,
+            token_count,
+            prev_id,
+            conversation_id,
+            datetime.now(timezone.utc).isoformat(),
+            'rag_system',
+            confidence,
+            citations_json,
+            False
+        ))
+        
+        message_id = cursor.lastrowid
+        self.db_retriever.conn.commit()
+        
+        return message_id
+    
+    def get_sliding_window(self, conversation_id: str, window_size: int = 6) -> List[Dict[str, Any]]:
+        """Get recent conversation messages."""
+        cursor = self.db_retriever.conn.cursor()
+        cursor.execute("""
+            SELECT * FROM chunks 
+            WHERE conversation_id = ? AND chunk_type IN ('user_msg', 'assistant_msg')
+            AND archived = FALSE
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (conversation_id, window_size))
+        
+        messages = []
+        for row in cursor.fetchall():
+            message = dict(row)
+            if message['citations']:
+                try:
+                    message['citations'] = json.loads(message['citations'])
+                except:
+                    message['citations'] = []
+            else:
+                message['citations'] = []
+            messages.append(message)
+        
+        return list(reversed(messages))  # Return in chronological order
+
+
 class RAGSystem:
-    """Complete RAG system with retrieval and generation."""
+    """Complete RAG system with retrieval and generation, now with conversation support."""
     
     def __init__(self, retriever, config: Optional[ConfigManager] = None):
         self.retriever = retriever
         self.config = config or ConfigManager()
         self.llm_manager = LLMManager(self.config)
         
+        # Add conversation manager
+        self.conversation_manager = ConversationManager(retriever.db_retriever, self.config)
+        
         # Configuration
         self.default_template = self.config.get('RAG_TEMPLATE', 'default')
         self.max_context_length = self.config.get('MAX_CONTEXT_LENGTH', 2000)
         
-        logger.info("RAG system initialized")
+        logger.info("RAG system initialized with conversation support")
     
     def answer_query(self, query: str, template: Optional[str] = None, 
                     llm_name: Optional[str] = None, top_k: int = 5) -> Dict[str, Any]:
@@ -470,6 +545,173 @@ class RAGSystem:
     def set_active_llm(self, llm_name: str) -> bool:
         """Set the active LLM."""
         return self.llm_manager.set_active_llm(llm_name)
+    
+    def answer_conversational_query(self, query: str, conversation_id: str, 
+                                  template: Optional[str] = None, 
+                                  llm_name: Optional[str] = None) -> Dict[str, Any]:
+        """Answer a query with both document and conversation context."""
+        
+        # Dual retrieval: documents + memory
+        doc_results, memory_results = self.retriever.search_dual(query, conversation_id)
+        
+        # Convert results to dict format if needed
+        if doc_results and hasattr(doc_results[0], 'to_dict'):
+            doc_results = [r.to_dict() for r in doc_results]
+        if memory_results and hasattr(memory_results[0], 'to_dict'):
+            memory_results = [r.to_dict() for r in memory_results]
+        
+        # Get sliding window
+        sliding_window = self.conversation_manager.get_sliding_window(conversation_id)
+        
+        # Build conversational prompt
+        template_name = template or self.default_template
+        prompt = self._build_conversational_prompt(
+            query, doc_results, memory_results, sliding_window, template_name
+        )
+        
+        # Generate answer
+        response = self.llm_manager.generate(prompt, llm_name)
+        
+        # Analyze response
+        citations, confidence = self._analyze_response(response, doc_results, memory_results)
+        
+        # Get last message ID for threading
+        last_msg_id = self._get_last_message_id(conversation_id)
+        
+        # Add user message
+        user_msg_id = self.conversation_manager.add_message(
+            conversation_id, 'user_msg', query, last_msg_id, 1.0
+        )
+        
+        # Add assistant message
+        assistant_msg_id = self.conversation_manager.add_message(
+            conversation_id, 'assistant_msg', response, user_msg_id, confidence, citations
+        )
+        
+        return {
+            'query': query,
+            'answer': response,
+            'doc_sources': [{'path': r.get('path', ''), 'chunk_id': r.get('chunk_id', ''), 
+                           'score': r.get('final_score', r.get('score', 0))} for r in doc_results],
+            'memory_sources': [{'content': r.get('text', ''), 'type': r.get('chunk_type', ''),
+                              'timestamp': r.get('timestamp', '')} for r in memory_results],
+            'sliding_window': sliding_window,
+            'llm_used': self.llm_manager.active_model,
+            'template_used': template_name,
+            'confidence': confidence,
+            'citations': citations,
+            'conversation_id': conversation_id,
+            'user_msg_id': user_msg_id,
+            'assistant_msg_id': assistant_msg_id
+        }
+    
+    def _build_conversational_prompt(self, query: str, doc_results: List[Dict], 
+                                   memory_results: List[Dict], sliding_window: List[Dict],
+                                   template: str) -> str:
+        """Build prompt with both document and conversation context."""
+        
+        # Enhanced system prompt for conversational RAG
+        system_prompt = """You are a helpful AI assistant with access to both documents and conversation history.
+
+IMPORTANT: You have access to:
+1. Documents from the knowledge base (cite as [doc:filename])
+2. Previous conversation turns (reference as [memory:context])
+
+Instructions:
+- Always search and use BOTH document knowledge AND conversation history
+- Answer questions using the provided context from documents and conversation history
+- Cite sources clearly: [doc:filename] for documents, [memory:context] for conversation
+- If information isn't in either context, say so clearly
+- Maintain conversation continuity using the chat history
+- Be comprehensive but concise
+
+"""
+        
+        # Recent conversation (sliding window)
+        conversation_context = ""
+        if sliding_window:
+            conversation_context = "Recent conversation:\n"
+            for msg in sliding_window[-4:]:  # Last 4 messages
+                role = "User" if msg['chunk_type'] == 'user_msg' else "Assistant"
+                conversation_context += f"{role}: {msg['chunk_text']}\n"
+            conversation_context += "\n"
+        
+        # Document context
+        docs_context = ""
+        if doc_results:
+            docs_context = "Relevant documents:\n"
+            for result in doc_results[:5]:  # Top 5 documents
+                filename = result.get('path', 'Unknown').split('/')[-1]
+                content = result.get('text', '')[:400]  # Limit for token budget
+                docs_context += f"[doc:{filename}] {content}\n"
+            docs_context += "\n"
+        
+        # Memory context (relevant past exchanges)
+        memory_context = ""
+        if memory_results:
+            memory_context = "Relevant conversation history:\n"
+            for msg in memory_results[:3]:  # Top 3 memory items
+                if msg['chunk_type'] == 'summary':
+                    memory_context += f"[memory:summary] {msg['chunk_text']}\n"
+                elif msg['chunk_type'] == 'assistant_msg':
+                    memory_context += f"[memory:response] {msg['chunk_text']}\n"
+                elif msg['chunk_type'] == 'user_msg':
+                    memory_context += f"[memory:question] {msg['chunk_text']}\n"
+            memory_context += "\n"
+        
+        # Assemble final prompt
+        prompt = (system_prompt + 
+                 conversation_context + 
+                 docs_context + 
+                 memory_context + 
+                 f"User: {query}\nAssistant: ")
+        
+        return prompt
+    
+    def _analyze_response(self, response: str, doc_results: List[Dict], 
+                         memory_results: List[Dict]) -> Tuple[List[str], float]:
+        """Analyze response for citations and confidence."""
+        
+        citations = []
+        confidence = 0.5  # Base confidence
+        
+        # Extract citations
+        import re
+        doc_citations = re.findall(r'\[doc:([^\]]+)\]', response)
+        memory_citations = re.findall(r'\[memory:([^\]]+)\]', response)
+        
+        citations.extend([f"doc:{cite}" for cite in doc_citations])
+        citations.extend([f"memory:{cite}" for cite in memory_citations])
+        
+        # Calculate confidence
+        if citations:
+            confidence += 0.3  # Boost for having citations
+        
+        # Check content overlap with documents
+        if doc_results:
+            response_words = set(response.lower().split())
+            doc_words = set()
+            for result in doc_results:
+                doc_words.update(result.get('text', '').lower().split())
+            
+            overlap = len(response_words.intersection(doc_words))
+            if overlap > 5:
+                confidence += 0.2
+        
+        confidence = min(1.0, max(0.0, confidence))
+        return citations, confidence
+    
+    def _get_last_message_id(self, conversation_id: str) -> Optional[int]:
+        """Get the last message ID in a conversation."""
+        cursor = self.conversation_manager.db_retriever.conn.cursor()
+        cursor.execute("""
+            SELECT id FROM chunks 
+            WHERE conversation_id = ? AND chunk_type IN ('user_msg', 'assistant_msg')
+            ORDER BY timestamp DESC LIMIT 1
+        """, (conversation_id,))
+        
+        result = cursor.fetchone()
+        return result[0] if result else None
 
 
 # Legacy compatibility functions

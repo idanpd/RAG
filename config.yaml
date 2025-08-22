@@ -55,6 +55,20 @@ KEYFRAME_EVERY_SEC: 3
 KEYFRAME_MAX: 10
 CAPTION_MAX_TOKENS: 32
 
+# Conversational RAG Settings
+DOC_SEARCH_K: 8                     # Documents to retrieve per turn
+MEMORY_SEARCH_K: 6                  # Memory items to retrieve per turn
+SLIDING_WINDOW_SIZE: 6              # Recent turns in context
+SUMMARIZATION_THRESHOLD: 10         # Turns before summarizing
+CONFIDENCE_THRESHOLD: 0.7           # Memory quality gate
+
+# Token Budgeting
+BUDGET_SYSTEM: 200                  # System prompt tokens
+BUDGET_DOCS: 1000                   # Document context tokens
+BUDGET_MEMORY: 600                  # Memory context tokens
+BUDGET_SLIDING_WINDOW: 800          # Recent conversation tokens
+MAX_CONTEXT_LENGTH: 2000            # Max prompt length
+
 # Logging
 LOG_LEVEL: INFO
 

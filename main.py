@@ -327,17 +327,18 @@ class SemanticSearchSystem:
         print("=" * 50)
     
     def conversation_mode(self):
-        """Run in conversational mode with memory."""
-        print("\n🤖 Conversational RAG Mode - Industry-Grade Chat with Memory")
+        """Run in conversational mode with memory AND document retrieval."""
+        print("\n🤖 Conversational RAG Mode - Documents + Memory")
         print("=" * 60)
+        print("✨ This mode searches BOTH your indexed documents AND conversation history!")
         
-        # Initialize conversational RAG system
+        # Initialize enhanced RAG system
         try:
-            from conversational_rag import ConversationalRAG
-            conv_rag = ConversationalRAG(self.config)
-            print("✅ Conversational RAG system initialized")
+            retriever = self.initialize_retriever()
+            rag_system = RAGSystem(retriever, self.config)
+            print("✅ Enhanced RAG system initialized")
         except Exception as e:
-            print(f"❌ Failed to initialize conversational RAG: {e}")
+            print(f"❌ Failed to initialize enhanced RAG: {e}")
             return
         
         # Check if index exists
@@ -352,12 +353,18 @@ class SemanticSearchSystem:
             return
         
         # Show available models
-        available_models = conv_rag.llm_manager.get_available_models()
+        available_models = rag_system.llm_manager.get_available_models()
         if available_models:
             print(f"\n🤖 Available models: {len(available_models)}")
             for model in available_models:
                 status = "🔥 LOADED" if model['is_loaded'] else "💤 Available"
                 print(f"  - {model['name']}: {model['description']} ({status})")
+        
+        # Show indexed documents info
+        indexer = self.initialize_indexer()
+        stats = indexer.get_stats()
+        print(f"\n📚 Knowledge Base: {stats['total_files']} files, {stats['total_chunks']} chunks")
+        print(f"📊 File types: {stats['files_by_type']}")
         
         print("\n📖 Commands:")
         print("  - Type your message to chat")
@@ -370,8 +377,10 @@ class SemanticSearchSystem:
         print()
         
         # Initialize conversation
-        current_conversation_id = conv_rag.create_conversation("CLI Conversation")
+        import uuid
+        current_conversation_id = str(uuid.uuid4())
         print(f"🆕 Started new conversation: {current_conversation_id[:8]}...")
+        print("💡 This conversation will search your indexed documents AND remember our chat!")
         
         debug_mode = False
         
@@ -387,38 +396,52 @@ class SemanticSearchSystem:
                     break
                 
                 elif user_input.lower() == 'new':
-                    current_conversation_id = conv_rag.create_conversation("CLI Conversation")
+                    current_conversation_id = str(uuid.uuid4())
                     print(f"🆕 Started new conversation: {current_conversation_id[:8]}...")
                     continue
                 
                 elif user_input.lower() == 'list':
-                    conversations = conv_rag.get_conversations()
+                    # Get conversations from database
+                    cursor = rag_system.conversation_manager.db_retriever.conn.cursor()
+                    cursor.execute("""
+                        SELECT DISTINCT conversation_id, COUNT(*) as msg_count, MIN(timestamp) as created
+                        FROM chunks 
+                        WHERE conversation_id IS NOT NULL AND archived = FALSE
+                        GROUP BY conversation_id
+                        ORDER BY MIN(timestamp) DESC
+                        LIMIT 10
+                    """)
+                    
+                    conversations = cursor.fetchall()
                     print(f"\n📋 Conversations ({len(conversations)}):")
-                    for conv in conversations[:10]:
-                        status = "🔥" if conv['id'] == current_conversation_id else "💬"
-                        print(f"  {status} {conv['id'][:8]}: {conv['title']} ({conv['message_count']} messages)")
+                    for conv in conversations:
+                        status = "🔥" if conv[0] == current_conversation_id else "💬"
+                        print(f"  {status} {conv[0][:8]}: {conv[1]} messages (created: {conv[2][:10]})")
                     continue
                 
                 elif user_input.lower().startswith('load '):
                     conv_id_prefix = user_input[5:].strip()
-                    conversations = conv_rag.get_conversations()
-                    matching_conv = None
-                    for conv in conversations:
-                        if conv['id'].startswith(conv_id_prefix):
-                            matching_conv = conv
-                            break
                     
-                    if matching_conv:
-                        current_conversation_id = matching_conv['id']
-                        print(f"📂 Loaded conversation: {matching_conv['title']}")
+                    # Find matching conversation
+                    cursor = rag_system.conversation_manager.db_retriever.conn.cursor()
+                    cursor.execute("""
+                        SELECT DISTINCT conversation_id FROM chunks 
+                        WHERE conversation_id LIKE ? AND archived = FALSE
+                        LIMIT 1
+                    """, (f"{conv_id_prefix}%",))
+                    
+                    result = cursor.fetchone()
+                    if result:
+                        current_conversation_id = result[0]
+                        print(f"📂 Loaded conversation: {current_conversation_id[:8]}")
                         
                         # Show recent history
-                        history = conv_rag.get_conversation_history(current_conversation_id, limit=6)
+                        history = rag_system.conversation_manager.get_sliding_window(current_conversation_id, 6)
                         if history:
                             print("Recent history:")
                             for msg in history[-6:]:
-                                role = "You" if msg.type == 'user_msg' else "Assistant"
-                                content = msg.content[:100] + "..." if len(msg.content) > 100 else msg.content
+                                role = "You" if msg['chunk_type'] == 'user_msg' else "Assistant"
+                                content = msg['chunk_text'][:80] + "..." if len(msg['chunk_text']) > 80 else msg['chunk_text']
                                 print(f"  {role}: {content}")
                     else:
                         print(f"❌ No conversation found starting with '{conv_id_prefix}'")
@@ -426,7 +449,7 @@ class SemanticSearchSystem:
                 
                 elif user_input.lower().startswith('model '):
                     model_name = user_input[6:].strip()
-                    if conv_rag.llm_manager.set_active_llm(model_name):
+                    if rag_system.llm_manager.set_active_llm(model_name):
                         print(f"✅ Switched to model: {model_name}")
                     else:
                         print(f"❌ Model not available: {model_name}")
@@ -437,33 +460,43 @@ class SemanticSearchSystem:
                     print(f"🔍 Debug mode: {'ON' if debug_mode else 'OFF'}")
                     continue
                 
-                # Process conversation turn
-                print("🤔 Thinking...")
+                # Process conversation turn with DUAL retrieval (docs + memory)
+                print("🔍 Searching documents + memory...")
                 start_time = time.time()
                 
-                turn = conv_rag.process_user_message(current_conversation_id, user_input)
+                # Use enhanced RAG system with conversation support
+                result = rag_system.answer_conversational_query(
+                    query=user_input,
+                    conversation_id=current_conversation_id
+                )
                 
                 processing_time = time.time() - start_time
                 
                 # Display response
-                print(f"\n🤖 Assistant: {turn.assistant_message.content}")
+                print(f"\n🤖 Assistant: {result['answer']}")
                 
                 # Show metadata
-                print(f"\n📊 Confidence: {turn.confidence:.2f} | "
-                      f"Citations: {len(turn.citations or [])} | "
-                      f"Time: {turn.total_time:.2f}s")
+                print(f"\n📊 Confidence: {result['confidence']:.2f} | "
+                      f"Citations: {len(result['citations'])} | "
+                      f"Time: {processing_time:.2f}s")
                 
                 # Debug information
                 if debug_mode:
                     print(f"\n🔍 Debug Info:")
-                    print(f"  - Documents retrieved: {len(turn.doc_results)}")
-                    print(f"  - Memory items: {len(turn.memory_results)}")
-                    print(f"  - Generation time: {turn.generation_time:.2f}s")
-                    print(f"  - Prompt tokens: {turn.prompt_metadata.get('total_tokens', 0)}")
-                    print(f"  - Token budget used: {turn.prompt_metadata.get('trimming_applied', False)}")
+                    print(f"  📚 Documents retrieved: {len(result['doc_sources'])}")
+                    print(f"  🧠 Memory items: {len(result['memory_sources'])}")
+                    print(f"  💬 Sliding window: {len(result['sliding_window'])}")
+                    print(f"  🤖 Model used: {result['llm_used']}")
                     
-                    if turn.citations:
-                        print(f"  - Citations: {', '.join(turn.citations)}")
+                    if result['citations']:
+                        print(f"  🔗 Citations: {', '.join(result['citations'])}")
+                    
+                    # Show top documents
+                    if result['doc_sources']:
+                        print("  📄 Top documents:")
+                        for i, doc in enumerate(result['doc_sources'][:3], 1):
+                            filename = doc['path'].split('/')[-1] if doc['path'] else 'Unknown'
+                            print(f"    {i}. {filename} (score: {doc['score']:.3f})")
                 
             except KeyboardInterrupt:
                 print("\nGoodbye! 👋")
@@ -475,7 +508,8 @@ class SemanticSearchSystem:
                     traceback.print_exc()
         
         # Cleanup
-        conv_rag.cleanup()
+        rag_system.retriever.close()
+        rag_system.llm_manager.cleanup()
     
     def cleanup(self):
         """Clean up resources."""

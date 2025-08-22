@@ -1,19 +1,16 @@
 """
-Enhanced Streamlit UI for Conversational RAG with Memory
-Industry-grade chat interface with conversation management.
+Enhanced Streamlit UI for Conversational RAG with Document + Memory Integration
+Fixed to ensure indexed documents are ALWAYS included in conversation answers.
 """
 
 import streamlit as st
+import tempfile
+import uuid
 import time
-from datetime import datetime
-from typing import Dict, List, Any, Optional
 import json
-
-# Import our conversational RAG system
-from conversational_rag import ConversationalRAG
-from conversation_memory import ConversationMessage
-from utils import ConfigManager
-from model_api import LocalModelAPI
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Any, Optional
 
 # Page configuration
 st.set_page_config(
@@ -23,40 +20,81 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for better chat UI
+# Enhanced CSS with white background and black text
 st.markdown("""
 <style>
+/* Force white background and black text */
+.stApp {
+    background-color: white !important;
+    color: black !important;
+}
+
+.main .block-container {
+    background-color: white !important;
+    color: black !important;
+}
+
+.stSidebar .block-container {
+    background-color: #f8f9fa !important;
+    color: black !important;
+}
+
+/* Chat message styling */
 .chat-message {
     padding: 1rem;
     border-radius: 0.5rem;
     margin-bottom: 1rem;
-    display: flex;
-    flex-direction: column;
+    border: 1px solid #ddd;
+    background-color: white !important;
+    color: black !important;
 }
+
 .user-message {
-    background-color: #e3f2fd;
-    margin-left: 20%;
+    background-color: #e3f2fd !important;
+    margin-left: 10%;
+    border-left: 4px solid #2196F3;
 }
+
 .assistant-message {
-    background-color: #f5f5f5;
-    margin-right: 20%;
+    background-color: #f8f9fa !important;
+    margin-right: 10%;
+    border-left: 4px solid #4CAF50;
 }
+
 .message-meta {
     font-size: 0.8rem;
-    color: #666;
+    color: #666 !important;
     margin-top: 0.5rem;
+    font-style: italic;
 }
-.conversation-item {
-    padding: 0.5rem;
+
+/* Button styling */
+.stButton > button {
+    background-color: #007bff !important;
+    color: white !important;
+    border: none !important;
     border-radius: 0.25rem;
-    margin-bottom: 0.5rem;
-    cursor: pointer;
 }
-.conversation-item:hover {
-    background-color: #f0f0f0;
+
+.stButton > button:hover {
+    background-color: #0056b3 !important;
 }
-.active-conversation {
-    background-color: #e3f2fd;
+
+/* Input styling */
+.stTextInput > div > div > input,
+.stChatInput > div > div > input {
+    background-color: white !important;
+    color: black !important;
+    border: 1px solid #ddd !important;
+}
+
+/* File uploader */
+.stFileUploader {
+    background-color: white !important;
+    color: black !important;
+    border: 2px dashed #007bff !important;
+    border-radius: 0.5rem;
+    padding: 1rem;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -64,231 +102,289 @@ st.markdown("""
 
 @st.cache_resource
 def initialize_system():
-    """Initialize the conversational RAG system."""
+    """Initialize the enhanced RAG system."""
     try:
+        from utils import ConfigManager
+        from indexer import SemanticIndexer
+        from retriever import SemanticRetriever
+        from rag import RAGSystem, LocalLLMManager
+        from model_api import LocalModelAPI
+        
         config = ConfigManager()
-        rag_system = ConversationalRAG(config)
+        
+        # Initialize components
+        indexer = SemanticIndexer(config)
+        retriever = SemanticRetriever(config)
+        rag_system = RAGSystem(retriever, config)
         model_api = LocalModelAPI(config)
-        return rag_system, model_api, None
+        
+        return {
+            'indexer': indexer,
+            'retriever': retriever,
+            'rag_system': rag_system,
+            'model_api': model_api,
+            'config': config
+        }, None
     except Exception as e:
-        return None, None, str(e)
+        return None, str(e)
 
 
-def initialize_session_state():
-    """Initialize Streamlit session state."""
-    if "rag_system" not in st.session_state:
-        rag_system, model_api, error = initialize_system()
-        st.session_state.rag_system = rag_system
-        st.session_state.model_api = model_api
-        st.session_state.init_error = error
-    
-    if "current_conversation_id" not in st.session_state:
-        st.session_state.current_conversation_id = None
-    
-    if "conversations" not in st.session_state:
-        st.session_state.conversations = []
-    
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
-    
-    if "show_debug" not in st.session_state:
-        st.session_state.show_debug = False
-
-
-def load_conversations():
-    """Load conversation list."""
-    if st.session_state.rag_system:
-        try:
-            conversations = st.session_state.rag_system.get_conversations()
-            st.session_state.conversations = conversations
-        except Exception as e:
-            st.error(f"Failed to load conversations: {e}")
-
-
-def load_conversation_history(conversation_id: str):
-    """Load history for a specific conversation."""
-    if st.session_state.rag_system:
-        try:
-            messages = st.session_state.rag_system.get_conversation_history(conversation_id)
+def process_uploaded_file(uploaded_file, system):
+    """Process uploaded file and add to index."""
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
             
-            # Convert to chat format
-            chat_history = []
-            for msg in messages:
-                if msg.type in ['user_msg', 'assistant_msg']:
-                    chat_history.append({
-                        'type': 'user' if msg.type == 'user_msg' else 'assistant',
-                        'content': msg.content,
-                        'timestamp': msg.timestamp,
-                        'confidence': msg.confidence if msg.type == 'assistant_msg' else None,
-                        'citations': msg.citations if msg.type == 'assistant_msg' else None,
-                        'id': msg.id
-                    })
+            # Save uploaded file
+            file_path = temp_path / uploaded_file.name
+            with open(file_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
             
-            st.session_state.chat_history = chat_history
+            # Process file using existing indexer
+            file_id, chunks = system['indexer'].process_file(file_path)
             
-        except Exception as e:
-            st.error(f"Failed to load conversation history: {e}")
+            if file_id > 0 and chunks:
+                # Generate embeddings
+                chunk_texts = [chunk.chunk_text for chunk in chunks]
+                embeddings = system['indexer'].embedding_manager.create_embeddings(chunk_texts)
+                
+                # Get next embedding ID
+                cursor = system['indexer'].db_manager.conn.cursor()
+                cursor.execute("SELECT MAX(emb_id) FROM chunks WHERE emb_id IS NOT NULL")
+                result = cursor.fetchone()
+                max_id = result[0] if result and result[0] is not None else -1
+                
+                # Update chunks with embedding IDs
+                for i, chunk in enumerate(chunks):
+                    chunk.emb_id = max_id + 1 + i
+                    chunk.chunk_type = 'doc'  # Ensure it's marked as document
+                
+                # Insert chunks
+                system['indexer'].db_manager.insert_chunks(chunks)
+                
+                # Update FAISS index
+                if hasattr(system['retriever'].dense_retriever, 'index') and system['retriever'].dense_retriever.index:
+                    system['retriever'].dense_retriever.index.add(embeddings.astype('float32'))
+                
+                return True
+        
+        return False
+    except Exception as e:
+        st.error(f"Error processing file: {e}")
+        return False
 
 
 def sidebar():
-    """Render sidebar with conversation management."""
+    """Enhanced sidebar with file upload and model management."""
     with st.sidebar:
         st.title("🤖 Conversational RAG")
         
-        # Model selection
-        if st.session_state.model_api:
-            available_models = st.session_state.model_api.list_available_models()
+        # System status
+        system, error = st.session_state.get('system'), st.session_state.get('init_error')
+        if system:
+            st.markdown('<span style="color: #28a745; font-weight: bold;">✅ System Ready</span>', 
+                       unsafe_allow_html=True)
+            
+            # Show knowledge base stats
+            try:
+                stats = system['indexer'].get_stats()
+                st.info(f"📚 Knowledge Base: {stats['total_files']} files, {stats['total_chunks']} chunks")
+            except:
+                pass
+        else:
+            st.markdown('<span style="color: #dc3545; font-weight: bold;">❌ System Error</span>', 
+                       unsafe_allow_html=True)
+            if error:
+                st.error(error)
+            return
+        
+        # File upload section
+        st.subheader("📁 Upload Documents")
+        uploaded_files = st.file_uploader(
+            "Add files to knowledge base",
+            accept_multiple_files=True,
+            type=['txt', 'pdf', 'docx', 'md', 'csv', 'xlsx', 'png', 'jpg', 'jpeg'],
+            help="Files will be automatically indexed and available in conversations"
+        )
+        
+        if uploaded_files:
+            if st.button("🚀 Process Files", use_container_width=True):
+                with st.spinner("Processing files..."):
+                    success_count = 0
+                    for uploaded_file in uploaded_files:
+                        if process_uploaded_file(uploaded_file, system):
+                            success_count += 1
+                            if 'uploaded_files' not in st.session_state:
+                                st.session_state.uploaded_files = []
+                            st.session_state.uploaded_files.append(uploaded_file.name)
+                    
+                    if success_count > 0:
+                        st.success(f"✅ Processed {success_count}/{len(uploaded_files)} files")
+                        st.rerun()
+                    else:
+                        st.error("❌ Failed to process files")
+        
+        # Show recently uploaded files
+        if st.session_state.get('uploaded_files'):
+            st.write("**Recently uploaded:**")
+            for filename in st.session_state.uploaded_files[-5:]:
+                st.write(f"📄 {filename}")
+        
+        st.divider()
+        
+        # Model management
+        st.subheader("🤖 Model Management")
+        
+        try:
+            available_models = system['model_api'].list_available_models()
             if available_models:
                 model_names = [model['name'] for model in available_models]
-                current_model = st.selectbox(
+                
+                # Model selection
+                selected_model_name = st.selectbox(
                     "Select Model",
                     model_names,
                     help="Choose the LLM for responses"
                 )
                 
-                # Show model info
-                selected_model = next(m for m in available_models if m['name'] == current_model)
+                selected_model = next(m for m in available_models if m['name'] == selected_model_name)
+                
+                # Model status
                 if selected_model['is_loaded']:
-                    st.success(f"✅ {selected_model['description']}")
+                    st.success(f"🔥 {selected_model['description']}")
+                    
+                    if st.button("🔄 Unload Model"):
+                        result = system['model_api'].unload_model(selected_model_name)
+                        if result['success']:
+                            st.success("Model unloaded")
+                            st.rerun()
                 else:
-                    if st.button(f"Load {current_model}"):
-                        with st.spinner(f"Loading {current_model}..."):
-                            result = st.session_state.model_api.load_model(current_model)
+                    st.info(f"💤 {selected_model['description']}")
+                    
+                    if st.button(f"⚡ Load {selected_model_name}"):
+                        with st.spinner(f"Loading {selected_model_name}..."):
+                            result = system['model_api'].load_model(selected_model_name)
                             if result['success']:
                                 st.success(f"Loaded in {result['load_time']:.1f}s")
                                 st.rerun()
                             else:
                                 st.error("Failed to load model")
+        except Exception as e:
+            st.error(f"Model management error: {e}")
         
         st.divider()
         
         # Conversation management
-        st.subheader("Conversations")
+        st.subheader("💬 Conversations")
         
         # New conversation button
-        if st.button("➕ New Conversation", use_container_width=True):
-            if st.session_state.rag_system:
-                new_conv_id = st.session_state.rag_system.create_conversation()
-                st.session_state.current_conversation_id = new_conv_id
-                st.session_state.chat_history = []
-                load_conversations()
-                st.rerun()
-        
-        # Load conversations
-        load_conversations()
-        
-        # Display conversations
-        for conv in st.session_state.conversations:
-            is_active = conv['id'] == st.session_state.current_conversation_id
-            
-            # Create conversation item
-            conv_container = st.container()
-            with conv_container:
-                if st.button(
-                    f"💬 {conv['title'][:30]}...",
-                    key=f"conv_{conv['id']}",
-                    use_container_width=True,
-                    type="primary" if is_active else "secondary"
-                ):
-                    st.session_state.current_conversation_id = conv['id']
-                    load_conversation_history(conv['id'])
-                    st.rerun()
-                
-                # Show conversation metadata
-                st.caption(f"Messages: {conv['message_count']} | {conv['created_at'][:10]}")
-        
-        st.divider()
+        if st.button("➕ New Chat", use_container_width=True, type="primary"):
+            new_conv_id = str(uuid.uuid4())
+            st.session_state.current_conversation_id = new_conv_id
+            st.session_state.chat_history = []
+            st.session_state.conversations[new_conv_id] = {
+                'title': f"Chat {datetime.now().strftime('%H:%M')}",
+                'created_at': datetime.now().isoformat(),
+                'message_count': 0
+            }
+            st.rerun()
         
         # Debug toggle
-        st.session_state.show_debug = st.checkbox("Show Debug Info")
-        
-        # System status
-        st.subheader("System Status")
-        if st.session_state.rag_system:
-            st.success("✅ RAG System Ready")
-        else:
-            st.error("❌ RAG System Error")
-            if st.session_state.init_error:
-                st.error(st.session_state.init_error)
+        st.session_state.show_debug = st.checkbox("🔍 Show Debug Info")
 
 
-def chat_interface():
-    """Main chat interface."""
+def main_chat_interface():
+    """Main chat interface with dual retrieval (documents + memory)."""
+    system = st.session_state.get('system')
+    rag_system = st.session_state.get('rag_system')
     
-    # Check if system is ready
-    if not st.session_state.rag_system:
-        st.error("System not initialized. Please check the sidebar for errors.")
+    if not system or not rag_system:
+        st.error("❌ System not initialized. Please check the sidebar.")
         return
     
-    # Chat header
+    # Header
     if st.session_state.current_conversation_id:
-        # Get conversation stats
-        try:
-            stats = st.session_state.rag_system.get_conversation_stats(
-                st.session_state.current_conversation_id
-            )
-            
-            col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
-            with col1:
-                st.subheader("💬 Chat")
-            with col2:
-                st.metric("Turns", stats.get('turn_count', 0))
-            with col3:
-                st.metric("Confidence", f"{stats.get('avg_confidence', 0):.2f}")
-            with col4:
-                st.metric("Tokens", stats.get('total_tokens', 0))
+        conv_info = st.session_state.conversations.get(
+            st.session_state.current_conversation_id,
+            {'title': 'Current Chat', 'message_count': 0}
+        )
         
-        except Exception as e:
-            st.subheader("💬 Chat")
-            if st.session_state.show_debug:
-                st.error(f"Stats error: {e}")
+        col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+        with col1:
+            st.title(f"💬 {conv_info['title']}")
+        with col2:
+            st.metric("Messages", conv_info['message_count'])
+        with col3:
+            uploaded_count = len(st.session_state.get('uploaded_files', []))
+            st.metric("Uploaded", uploaded_count)
+        with col4:
+            try:
+                stats = system['indexer'].get_stats()
+                st.metric("Total Docs", stats['total_files'])
+            except:
+                st.metric("Total Docs", "?")
     else:
-        st.subheader("💬 Select or create a conversation to start chatting")
+        st.title("💬 Conversational RAG")
+        st.info("👈 Click 'New Chat' in the sidebar to start a conversation")
+        st.info("💡 Conversations will search BOTH your indexed documents AND chat history!")
         return
     
     # Chat history display
-    chat_container = st.container()
-    with chat_container:
-        for message in st.session_state.chat_history:
-            message_class = "user-message" if message['type'] == 'user' else "assistant-message"
-            
-            st.markdown(f"""
-            <div class="chat-message {message_class}">
-                <div><strong>{'You' if message['type'] == 'user' else 'Assistant'}:</strong></div>
-                <div>{message['content']}</div>
-                <div class="message-meta">
-                    {message['timestamp'][:19]}
-                    {f" | Confidence: {message['confidence']:.2f}" if message.get('confidence') else ""}
-                    {f" | Citations: {len(message['citations'])}" if message.get('citations') else ""}
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+    for message in st.session_state.chat_history:
+        message_class = "user-message" if message['type'] == 'user' else "assistant-message"
+        
+        # Format metadata
+        meta_parts = []
+        if message.get('timestamp'):
+            try:
+                dt = datetime.fromisoformat(message['timestamp'].replace('Z', '+00:00'))
+                meta_parts.append(dt.strftime('%H:%M:%S'))
+            except:
+                meta_parts.append(message['timestamp'][:19])
+        
+        if message.get('confidence') is not None:
+            meta_parts.append(f"Confidence: {message['confidence']:.2f}")
+        
+        if message.get('citations'):
+            meta_parts.append(f"Citations: {len(message['citations'])}")
+        
+        meta_str = " | ".join(meta_parts)
+        
+        st.markdown(f"""
+        <div class="chat-message {message_class}">
+            <div><strong>{'You' if message['type'] == 'user' else '🤖 Assistant'}:</strong></div>
+            <div style="margin: 0.5rem 0;">{message['content']}</div>
+            <div class="message-meta">{meta_str}</div>
+        </div>
+        """, unsafe_allow_html=True)
     
     # Chat input
-    st.divider()
+    user_input = st.chat_input("Type your message... (searches documents + memory)")
     
-    # User input
-    user_input = st.chat_input("Type your message...")
-    
-    if user_input:
-        # Add user message to display immediately
+    if user_input and st.session_state.current_conversation_id:
+        # Add user message to display
         st.session_state.chat_history.append({
             'type': 'user',
             'content': user_input,
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'confidence': None,
-            'citations': None,
-            'id': None
+            'citations': []
         })
         
-        # Process with RAG system
-        with st.spinner("Thinking..."):
+        # Update conversation count
+        conv_id = st.session_state.current_conversation_id
+        if conv_id in st.session_state.conversations:
+            st.session_state.conversations[conv_id]['message_count'] += 1
+        
+        # Process with enhanced RAG system (documents + memory)
+        with st.spinner("🔍 Searching documents + memory..."):
             try:
                 start_time = time.time()
                 
-                turn = st.session_state.rag_system.process_user_message(
-                    st.session_state.current_conversation_id,
-                    user_input
+                # Use conversational query method (searches BOTH docs and memory)
+                result = rag_system.answer_conversational_query(
+                    query=user_input,
+                    conversation_id=conv_id
                 )
                 
                 processing_time = time.time() - start_time
@@ -296,54 +392,90 @@ def chat_interface():
                 # Add assistant response to display
                 st.session_state.chat_history.append({
                     'type': 'assistant',
-                    'content': turn.assistant_message.content,
-                    'timestamp': turn.assistant_message.timestamp,
-                    'confidence': turn.confidence,
-                    'citations': turn.citations,
-                    'id': turn.assistant_message.id
+                    'content': result['answer'],
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                    'confidence': result['confidence'],
+                    'citations': result['citations']
                 })
+                
+                # Update conversation count
+                st.session_state.conversations[conv_id]['message_count'] += 1
                 
                 # Show debug info if enabled
                 if st.session_state.show_debug:
-                    with st.expander("🔍 Debug Information"):
+                    with st.expander("🔍 Debug Information", expanded=False):
                         col1, col2 = st.columns(2)
                         
                         with col1:
-                            st.subheader("Retrieval Results")
-                            st.write(f"**Documents:** {len(turn.doc_results)}")
-                            for i, doc in enumerate(turn.doc_results[:3]):
-                                st.write(f"{i+1}. {doc.get('path', 'Unknown')[:50]}...")
+                            st.write("**📚 Document Results:**")
+                            for i, doc in enumerate(result['doc_sources'][:5]):
+                                filename = doc['path'].split('/')[-1] if doc['path'] else 'Unknown'
+                                st.write(f"{i+1}. {filename} (score: {doc['score']:.3f})")
                             
-                            st.write(f"**Memory Items:** {len(turn.memory_results)}")
-                            for i, (msg, score) in enumerate(turn.memory_results[:3]):
-                                st.write(f"{i+1}. {msg.content[:50]}... (score: {score:.3f})")
+                            st.write("**🧠 Memory Results:**")
+                            for i, mem in enumerate(result['memory_sources'][:3]):
+                                content = mem['content'][:50] + "..." if len(mem['content']) > 50 else mem['content']
+                                st.write(f"{i+1}. {mem['type']}: {content}")
                         
                         with col2:
-                            st.subheader("Generation Metadata")
-                            st.json({
-                                'total_time': f"{turn.total_time:.2f}s",
-                                'generation_time': f"{turn.generation_time:.2f}s",
-                                'confidence': turn.confidence,
-                                'citations_count': len(turn.citations or []),
-                                'prompt_tokens': turn.prompt_metadata.get('total_tokens', 0),
-                                'trimming_applied': turn.prompt_metadata.get('trimming_applied', False)
-                            })
+                            st.write("**⚙️ Generation Info:**")
+                            debug_info = {
+                                'processing_time': f"{processing_time:.2f}s",
+                                'confidence': result['confidence'],
+                                'citations_count': len(result['citations']),
+                                'doc_sources': len(result['doc_sources']),
+                                'memory_sources': len(result['memory_sources']),
+                                'sliding_window': len(result['sliding_window']),
+                                'model_used': result['llm_used']
+                            }
+                            st.json(debug_info)
+                            
+                            if result['citations']:
+                                st.write("**🔗 Citations:**")
+                                for citation in result['citations']:
+                                    st.write(f"- {citation}")
                 
                 st.rerun()
                 
             except Exception as e:
-                st.error(f"Error processing message: {e}")
+                st.error(f"❌ Error processing message: {e}")
                 if st.session_state.show_debug:
                     st.exception(e)
 
 
 def main():
-    """Main application."""
-    initialize_session_state()
+    """Main Streamlit application."""
+    # Initialize session state
+    if "system" not in st.session_state:
+        system, error = initialize_system()
+        st.session_state.system = system
+        st.session_state.init_error = error
+        
+        # Initialize RAG system
+        if system:
+            try:
+                st.session_state.rag_system = system['rag_system']
+            except Exception as e:
+                st.session_state.rag_system = None
+    
+    if "current_conversation_id" not in st.session_state:
+        st.session_state.current_conversation_id = None
+    
+    if "conversations" not in st.session_state:
+        st.session_state.conversations = {}
+    
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    
+    if "show_debug" not in st.session_state:
+        st.session_state.show_debug = False
+    
+    if "uploaded_files" not in st.session_state:
+        st.session_state.uploaded_files = []
     
     # Layout
     sidebar()
-    chat_interface()
+    main_chat_interface()
 
 
 if __name__ == "__main__":
