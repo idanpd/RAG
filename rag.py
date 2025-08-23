@@ -610,21 +610,13 @@ class RAGSystem:
                                    template: str) -> str:
         """Build prompt with both document and conversation context."""
         
-        # Enhanced system prompt for conversational RAG
-        system_prompt = """You are a helpful AI assistant with access to both documents and conversation history.
-
-IMPORTANT: You have access to:
-1. Documents from the knowledge base (cite as [doc:filename])
-2. Previous conversation turns (reference as [memory:context])
+        # Simplified system prompt for conversational RAG
+        system_prompt = """You are a helpful AI assistant with access to documents and conversation history.
 
 Instructions:
-- Always search and use BOTH document knowledge AND conversation history
 - Answer questions using the provided context from documents and conversation history
-- Cite sources clearly: [doc:filename] for documents, [memory:context] for conversation
-- If information isn't in either context, say so clearly
-- Maintain conversation continuity using the chat history
-- Be comprehensive but concise
-
+- Cite sources using [doc:filename] for documents and [memory:turn] for conversation context
+- If information is not in the provided context, say so clearly
 """
         
         # Recent conversation (sliding window)
@@ -632,8 +624,12 @@ Instructions:
         if sliding_window:
             conversation_context = "Recent conversation:\n"
             for msg in sliding_window[-4:]:  # Last 4 messages
-                role = "User" if msg['chunk_type'] == 'user_msg' else "Assistant"
-                conversation_context += f"{role}: {msg['chunk_text']}\n"
+                # Handle both dict and object representations
+                chunk_type = msg.get('chunk_type') if isinstance(msg, dict) else getattr(msg, 'chunk_type', '')
+                text = msg.get('chunk_text') or msg.get('text', '') if isinstance(msg, dict) else getattr(msg, 'text', '')
+                
+                role = "User" if chunk_type == 'user_msg' else "Assistant"
+                conversation_context += f"{role}: {text}\n"
             conversation_context += "\n"
         
         # Document context
@@ -651,12 +647,16 @@ Instructions:
         if memory_results:
             memory_context = "Relevant conversation history:\n"
             for msg in memory_results[:3]:  # Top 3 memory items
-                if msg['chunk_type'] == 'summary':
-                    memory_context += f"[memory:summary] {msg['chunk_text']}\n"
-                elif msg['chunk_type'] == 'assistant_msg':
-                    memory_context += f"[memory:response] {msg['chunk_text']}\n"
-                elif msg['chunk_type'] == 'user_msg':
-                    memory_context += f"[memory:question] {msg['chunk_text']}\n"
+                # Handle both SearchResult objects and dict representations
+                chunk_type = msg.get('chunk_type') if isinstance(msg, dict) else getattr(msg, 'chunk_type', '')
+                text = msg.get('text') or msg.get('chunk_text', '') if isinstance(msg, dict) else getattr(msg, 'text', '')
+                
+                if chunk_type == 'summary':
+                    memory_context += f"[memory:summary] {text}\n"
+                elif chunk_type == 'assistant_msg':
+                    memory_context += f"[memory:response] {text}\n"
+                elif chunk_type == 'user_msg':
+                    memory_context += f"[memory:question] {text}\n"
             memory_context += "\n"
         
         # Assemble final prompt

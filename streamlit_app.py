@@ -118,6 +118,23 @@ def initialize_system():
         rag_system = RAGSystem(retriever, config)
         model_api = LocalModelAPI(config)
         
+        # Ensure index is built from DATA_PATH if it doesn't exist
+        try:
+            stats = indexer.get_stats()
+            if stats['total_chunks'] == 0:
+                # No data indexed yet, build from DATA_PATH
+                data_path = config.get('DATA_PATH', './data')
+                if Path(data_path).exists():
+                    indexer.index_directory(data_path)
+        except Exception as e:
+            # Index might not exist, try to build it
+            data_path = config.get('DATA_PATH', './data')
+            if Path(data_path).exists():
+                try:
+                    indexer.index_directory(data_path)
+                except Exception:
+                    pass  # Continue even if indexing fails
+        
         return {
             'indexer': indexer,
             'retriever': retriever,
@@ -162,8 +179,34 @@ def process_uploaded_file(uploaded_file, system):
                 # Insert chunks
                 system['indexer'].db_manager.insert_chunks(chunks)
                 
-                # Update FAISS index
+                # Update FAISS index with consistency check
                 if hasattr(system['retriever'].dense_retriever, 'index') and system['retriever'].dense_retriever.index:
+                    # Check FAISS index size matches database
+                    cursor.execute("SELECT COUNT(*) FROM chunks WHERE emb_id IS NOT NULL")
+                    db_count = cursor.fetchone()[0]
+                    faiss_count = system['retriever'].dense_retriever.index.ntotal
+                    
+                    # If mismatch, rebuild FAISS index
+                    if abs(db_count - faiss_count) > len(chunks):
+                        # Significant mismatch, rebuild FAISS
+                        cursor.execute("SELECT emb_id FROM chunks WHERE emb_id IS NOT NULL ORDER BY emb_id")
+                        emb_ids = [row[0] for row in cursor.fetchall()]
+                        if emb_ids:
+                            # Get all embeddings and rebuild
+                            all_embeddings = []
+                            for emb_id in emb_ids:
+                                cursor.execute("SELECT chunk_text FROM chunks WHERE emb_id = ?", (emb_id,))
+                                text_row = cursor.fetchone()
+                                if text_row:
+                                    emb = system['indexer'].embedding_manager.create_embeddings([text_row[0]])
+                                    all_embeddings.append(emb[0])
+                            
+                            if all_embeddings:
+                                import numpy as np
+                                all_embeddings = np.array(all_embeddings).astype('float32')
+                                system['retriever'].dense_retriever._build_index(all_embeddings)
+                    
+                    # Add new embeddings
                     system['retriever'].dense_retriever.index.add(embeddings.astype('float32'))
                 
                 return True
@@ -197,6 +240,23 @@ def sidebar():
             if error:
                 st.error(error)
             return
+        
+        # Conversation management - moved above file upload
+        st.subheader("💬 New Chat")
+        
+        # New conversation button
+        if st.button("➕ New Chat", use_container_width=True, type="primary"):
+            new_conv_id = str(uuid.uuid4())
+            st.session_state.current_conversation_id = new_conv_id
+            st.session_state.chat_history = []
+            st.session_state.conversations[new_conv_id] = {
+                'title': f"Chat {datetime.now().strftime('%H:%M')}",
+                'created_at': datetime.now().isoformat(),
+                'message_count': 0
+            }
+            st.rerun()
+        
+        st.divider()
         
         # File upload section
         st.subheader("📁 Upload Documents")
@@ -273,21 +333,6 @@ def sidebar():
             st.error(f"Model management error: {e}")
         
         st.divider()
-        
-        # Conversation management
-        st.subheader("💬 Conversations")
-        
-        # New conversation button
-        if st.button("➕ New Chat", use_container_width=True, type="primary"):
-            new_conv_id = str(uuid.uuid4())
-            st.session_state.current_conversation_id = new_conv_id
-            st.session_state.chat_history = []
-            st.session_state.conversations[new_conv_id] = {
-                'title': f"Chat {datetime.now().strftime('%H:%M')}",
-                'created_at': datetime.now().isoformat(),
-                'message_count': 0
-            }
-            st.rerun()
         
         # Debug toggle
         st.session_state.show_debug = st.checkbox("🔍 Show Debug Info")

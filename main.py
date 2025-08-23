@@ -650,9 +650,9 @@ Examples:
             return 0
         
         else:
-            # Default to interactive if no specific action
-            print("No action specified. Starting interactive mode...")
-            system.interactive_mode()
+            # Default to conversation mode if no specific action
+            print("No action specified. Starting conversation mode...")
+            system.conversation_mode()
             return 0
     
     except KeyboardInterrupt:
