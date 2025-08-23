@@ -555,10 +555,14 @@ class RAGSystem:
         doc_results, memory_results = self.retriever.search_dual(query, conversation_id)
         
         # Convert results to dict format if needed
-        if doc_results and hasattr(doc_results[0], 'to_dict'):
+        if doc_results and len(doc_results) > 0 and hasattr(doc_results[0], 'to_dict'):
             doc_results = [r.to_dict() for r in doc_results]
-        if memory_results and hasattr(memory_results[0], 'to_dict'):
+        if memory_results and len(memory_results) > 0 and hasattr(memory_results[0], 'to_dict'):
             memory_results = [r.to_dict() for r in memory_results]
+        
+        # Ensure results are lists
+        doc_results = doc_results or []
+        memory_results = memory_results or []
         
         # Get sliding window
         sliding_window = self.conversation_manager.get_sliding_window(conversation_id)
